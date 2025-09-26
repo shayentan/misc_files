@@ -1,0 +1,492 @@
+
+# train_and_predict_all_usecases.py
+import os
+import json
+import joblib
+from typing import List, Dict, Any, Optional, Tuple
+
+import pandas as pd
+import numpy as np
+from fuzzywuzzy import process
+from sentence_transformers import SentenceTransformer
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics.pairwise import cosine_similarity
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv, GATConv
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+DATA_PATH = "campaign_defects.xlsx"            # input Excel
+ARTIFACT_DIR = "artifacts"
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+FUZZY_THRESHOLD = 80
+BERT_MODEL_NAME = "all-MiniLM-L6-v2"          # small & fast SBERT model
+META_DIM = 10                                 # dimension for meta features (you can change)
+TRAIN_EPOCHS = 15
+LR = 5e-4
+BATCH_SIZE = 64
+TOP_K = 5
+
+# ----------------------------
+# Utility: Business rules extractor & fuzzy matcher
+# ----------------------------
+def extract_business_rules_from_df(df: pd.DataFrame, columns_to_check: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+    if columns_to_check is None:
+        columns_to_check = ["asset_type", "campaign_type", "product"]
+    rules = {}
+    for col in columns_to_check:
+        grouped = df.groupby("campaign_name")[col].nunique()
+        # 1:1 mappings only
+        for campaign in grouped[grouped == 1].index:
+            if campaign not in rules:
+                rules[campaign] = {}
+            value = df.loc[df["campaign_name"] == campaign, col].iloc[0]
+            rules[campaign][col] = value
+    return rules
+
+def fuzzy_lookup_campaign(campaign_input: str, rules: Dict[str, Dict[str, Any]], threshold: int = FUZZY_THRESHOLD):
+    if not rules:
+        return None
+    match = process.extractOne(campaign_input, list(rules.keys()))
+    if match and match[1] >= threshold:
+        return {match[0]: rules[match[0]]}
+    return None
+
+# ----------------------------
+# AdvancedHybridModel (same architecture used for all use cases)
+# - includes methods to get shared latent vector for embeddings (for recommendations)
+# ----------------------------
+class AdvancedHybridModel(nn.Module):
+    def __init__(self, bert_dim: int, meta_dim: int, gnn_in_dim: int, gnn_hidden: int, shared_dim: int, num_classes: int):
+        super().__init__()
+        # project BERT embedding
+        self.bert_proj = nn.Linear(bert_dim, 512)
+        # GNN layers
+        self.gcn1 = GCNConv(gnn_in_dim, gnn_hidden)
+        self.gat = GATConv(gnn_hidden, 128, heads=1, concat=True)
+        # meta projection
+        self.meta_proj = nn.Sequential(nn.Linear(meta_dim, 64), nn.ReLU())
+        # shared dense
+        combined_dim = 512 + 128 + 64
+        self.shared_net = nn.Sequential(
+            nn.Linear(combined_dim, shared_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(shared_dim, shared_dim // 2),
+            nn.ReLU()
+        )
+        self.classifier = nn.Linear(shared_dim // 2, num_classes)
+
+    def forward(self, bert_emb: torch.Tensor, node_idx: torch.Tensor, x_nodes: torch.Tensor, edge_index: torch.Tensor, meta_feats: torch.Tensor):
+        """
+        bert_emb: (batch, bert_dim)
+        node_idx: (batch,) long
+        x_nodes: (N, gnn_in_dim)
+        edge_index: (2, E)
+        meta_feats: (batch, meta_dim)
+        """
+        # GNN
+        gcn_h = self.gcn1(x_nodes, edge_index)          # (N, gnn_hidden)
+        gat_h = self.gat(gcn_h, edge_index)             # (N, 128)
+        # attention-like pooling over nodes (simple mean here)
+        # but we will extract specific node embeddings for node_idx
+        node_emb_batch = gat_h[node_idx]                # (batch, 128)
+
+        bert_proj = self.bert_proj(bert_emb)            # (batch, 512)
+        meta_proj = self.meta_proj(meta_feats)          # (batch, 64)
+
+        combined = torch.cat([bert_proj, node_emb_batch, meta_proj], dim=1)  # (batch, combined)
+        shared = self.shared_net(combined)              # (batch, shared_half)
+        logits = self.classifier(shared)                # (batch, num_classes)
+        return logits
+
+    def get_shared_embedding(self, bert_emb: torch.Tensor, node_idx: torch.Tensor, x_nodes: torch.Tensor, edge_index: torch.Tensor, meta_feats: torch.Tensor) -> torch.Tensor:
+        """
+        Returns the 'shared' latent vector (before classifier) used for similarity/recommendations.
+        """
+        gcn_h = self.gcn1(x_nodes, edge_index)
+        gat_h = self.gat(gcn_h, edge_index)
+        node_emb_batch = gat_h[node_idx]
+        bert_proj = self.bert_proj(bert_emb)
+        meta_proj = self.meta_proj(meta_feats)
+        combined = torch.cat([bert_proj, node_emb_batch, meta_proj], dim=1)
+        shared = self.shared_net(combined)
+        return shared  # (batch, shared_dim//2)
+
+# ----------------------------
+# Helpers: Graph builder & nearest node finder
+# ----------------------------
+def build_graph_from_node_texts(node_texts: List[str], bert_model: SentenceTransformer) -> Tuple[Data, np.ndarray]:
+    """
+    Build simple chain graph (i -> i+1) with node_features from BERT encoding of node_texts.
+    Returns PyG Data and node_embeddings numpy array.
+    """
+    node_embeddings = bert_model.encode(node_texts, convert_to_numpy=True)
+    N = len(node_texts)
+    if N >= 2:
+        edges = [[i, i+1] for i in range(N-1)]
+    else:
+        edges = []
+    if edges:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(DEVICE)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long).to(DEVICE)
+    x_nodes = torch.tensor(node_embeddings, dtype=torch.float).to(DEVICE)
+    graph = Data(x=x_nodes, edge_index=edge_index)
+    return graph, node_embeddings
+
+def find_closest_node(input_emb: np.ndarray, node_embeddings: np.ndarray) -> int:
+    # cosine similarity
+    a = input_emb / (np.linalg.norm(input_emb) + 1e-12)
+    b = node_embeddings / (np.linalg.norm(node_embeddings, axis=1, keepdims=True) + 1e-12)
+    sims = b.dot(a)
+    return int(np.argmax(sims))
+
+# ----------------------------
+# Prepare training targets as single JSON string per row + encode
+# ----------------------------
+def prepare_single_target_column(df: pd.DataFrame, target_cols: List[str], usecase_name: str) -> pd.DataFrame:
+    target_col = f"{usecase_name}_target"
+    input_col = f"{usecase_name}_input"
+    # build input col if not present (caller should set input text)
+    if input_col not in df.columns:
+        raise ValueError(f"{input_col} not present in df; populate it before calling this function")
+    df[target_col] = df[target_cols].apply(lambda r: json.dumps(r.to_dict()), axis=1)
+    le = LabelEncoder()
+    df[target_col] = le.fit_transform(df[target_col].astype(str))
+    # save encoder mapping so we can decode later
+    joblib.dump(le, os.path.join(ARTIFACT_DIR, f"encoder_{usecase_name}_target.joblib"))
+    return df, le
+
+# ----------------------------
+# Train function for a use case (Hybrid model)
+# ----------------------------
+def train_usecase_hybrid(df: pd.DataFrame, usecase_name: str, input_col: str, target_cols: List[str],
+                         epochs: int = TRAIN_EPOCHS) -> Dict[str, Any]:
+    """
+    Trains AdvancedHybridModel for a given use case where:
+      - df[input_col] exists and is text input per row
+      - targets are target_cols (list)
+    Saves artifacts:
+      - artifacts/bert_model_{usecase}.joblib
+      - artifacts/{usecase}_model.pth
+      - artifacts/encoder_{usecase}_target.joblib  (created inside prepare_single_target_column)
+      - artifacts/{usecase}_shared_embeddings.npy (latent shared embedding per row)
+      - artifacts/{usecase}_mapping.json (maps row idx -> original target JSON)
+    Returns dict with training metadata.
+    """
+    print(f"\n--- Training {usecase_name} ---")
+    # 1) Prepare inputs and targets
+    texts = df[input_col].astype(str).tolist()
+    target_cols_local = target_cols.copy()
+
+    df_local = df.copy()
+    df_local, le_target = prepare_single_target_column(df_local, target_cols_local, usecase_name)
+
+    # 2) BERT encode inputs (we will save BERT model)
+    bert = SentenceTransformer(BERT_MODEL_NAME)
+    bert_save_path = os.path.join(ARTIFACT_DIR, f"bert_model_{usecase_name}.joblib")
+    joblib.dump(bert, bert_save_path)
+
+    emb_inputs = bert.encode(texts, convert_to_numpy=True)  # (N, D)
+    N, bert_dim = emb_inputs.shape
+    print(f"{usecase_name}: encoded {N} samples, emb_dim={bert_dim}")
+
+    # 3) Build graph: use node_texts = df[input_col] (one node per row)
+    graph, node_embeddings = build_graph_from_node_texts(texts, bert)
+
+    # 4) meta features: derive simple meta features from business rules/statistics (example)
+    #    Here we create deterministic meta features: one-hot of whether campaign has unique asset_type/product etc.
+    #    For demo we create zero meta features.
+    meta_feats = np.zeros((N, META_DIM), dtype=np.float32)
+
+    # 5) Prepare tensors
+    input_emb_tensor = torch.tensor(emb_inputs, dtype=torch.float).to(DEVICE)          # (N, bert_dim)
+    x_nodes = graph.x.to(DEVICE)
+    edge_index = graph.edge_index.to(DEVICE)
+    node_idx_tensor = torch.arange(N, dtype=torch.long).to(DEVICE)                    # using row i -> node i
+    target_tensor = torch.tensor(df_local[f"{usecase_name}_target"].values, dtype=torch.long).to(DEVICE)
+    meta_tensor = torch.tensor(meta_feats, dtype=torch.float).to(DEVICE)
+
+    # 6) instantiate model
+    num_classes = len(le_target.classes_)
+    model = AdvancedHybridModel(bert_dim=bert_dim, meta_dim=META_DIM, gnn_in_dim=bert_dim, gnn_hidden=256, shared_dim=512, num_classes=num_classes).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    # training loop (simple full-batch training for clarity; for big data use mini-batching)
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        logits = model(input_emb_tensor, node_idx_tensor, x_nodes, edge_index, meta_tensor)
+        loss = criterion(logits, target_tensor)
+        loss.backward()
+        optimizer.step()
+        print(f"{usecase_name} epoch {epoch+1}/{epochs} loss={loss.item():.4f}")
+
+    # 7) Save model state_dict
+    model_path = os.path.join(ARTIFACT_DIR, f"{usecase_name}_model.pth")
+    torch.save(model.state_dict(), model_path)
+
+    # 8) Extract shared embeddings (latent) per row for recommendation store
+    model.eval()
+    with torch.no_grad():
+        shared_batch = model.get_shared_embedding(input_emb_tensor, node_idx_tensor, x_nodes, edge_index, meta_tensor)
+        shared_np = shared_batch.cpu().numpy()  # (N, shared_dim_half)
+    emb_file = os.path.join(ARTIFACT_DIR, f"{usecase_name}_shared_embeddings.npy")
+    np.save(emb_file, shared_np)
+
+    # 9) Build mapping from row index -> decoded target JSON (for easier lookup)
+    mapping = {int(i): json.loads(le_target.inverse_transform([int(v)])[0]) for i, v in enumerate(df_local[f"{usecase_name}_target"].values)}
+    with open(os.path.join(ARTIFACT_DIR, f"{usecase_name}_mapping.json"), "w") as f:
+        json.dump(mapping, f, indent=2)
+
+    # 10) Save some metadata
+    meta = {
+        "usecase": usecase_name,
+        "model_path": model_path,
+        "bert_path": bert_save_path,
+        "embeddings_path": emb_file,
+        "mapping_path": os.path.join(ARTIFACT_DIR, f"{usecase_name}_mapping.json"),
+        "num_samples": N,
+        "num_classes": num_classes
+    }
+    meta_path = os.path.join(ARTIFACT_DIR, f"{usecase_name}_meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"{usecase_name} training complete. artifacts saved under {ARTIFACT_DIR}")
+    return meta
+
+# ----------------------------
+# Recommendation helpers: top-k over stored shared embeddings
+# ----------------------------
+def load_shared_embeddings(usecase_name: str) -> np.ndarray:
+    path = os.path.join(ARTIFACT_DIR, f"{usecase_name}_shared_embeddings.npy")
+    return np.load(path)
+
+def build_recommendation_stores(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Build campaign / product / defect_cluster vectors aggregated from per-row shared embeddings,
+    stored per usecase. We'll aggregate by campaign name and product and defect cluster (type+gravity).
+    """
+    stores = {}
+    # For simplicity we build stores from uc2 shared embeddings (defect summary model) if exists else uc1
+    for uc in ["uc1", "uc2", "uc3", "uc4"]:
+        emb_path = os.path.join(ARTIFACT_DIR, f"{uc}_shared_embeddings.npy")
+        mapping_path = os.path.join(ARTIFACT_DIR, f"{uc}_mapping.json")
+        if os.path.exists(emb_path) and os.path.exists(mapping_path):
+            emb = np.load(emb_path)  # (N, D)
+            mapping = json.load(open(mapping_path))
+            # Build mapping arrays
+            # extract campaign_name and product and defect cluster from mapping decoded JSON
+            campaigns = []
+            products = []
+            clusters = []
+            for i in range(len(emb)):
+                obj = mapping[str(i)]
+                campaigns.append(obj.get("campaign_name", "Unknown"))
+                products.append(obj.get("product", "Unknown"))
+                cluster = f"{obj.get('defect_type','Unknown')}_{obj.get('defect_gravity','Unknown')}"
+                clusters.append(cluster)
+            campaigns = np.array(campaigns)
+            products = np.array(products)
+            clusters = np.array(clusters)
+            # Aggregate embeddings by unique value (mean)
+            def aggregate_by_key(values_array):
+                uniq, inv = np.unique(values_array, return_inverse=True)
+                mats = []
+                for j,u in enumerate(uniq):
+                    mats.append(emb[inv==j].mean(axis=0))
+                return uniq.tolist(), np.vstack(mats) if mats else np.zeros((0, emb.shape[1]))
+            camp_keys, camp_mat = aggregate_by_key(campaigns)
+            prod_keys, prod_mat = aggregate_by_key(products)
+            clus_keys, clus_mat = aggregate_by_key(clusters)
+            stores[uc] = {
+                "campaign_keys": camp_keys, "campaign_mat": camp_mat,
+                "product_keys": prod_keys, "product_mat": prod_mat,
+                "cluster_keys": clus_keys, "cluster_mat": clus_mat
+            }
+    return stores
+
+# ----------------------------
+# Prediction / inference function per usecase
+# ----------------------------
+def predict_usecase(usecase_name: str, input_values: List[str], df_train: pd.DataFrame, K: int = TOP_K) -> Dict[str, Any]:
+    """
+    Returns:
+     - rule_based_output (if campaign present)
+     - ml_prediction (top1 decoded dict)
+     - ml_topk (list of decoded dicts with scores)
+     - recommendations: top campaigns, products, defect clusters (from aggregated store)
+    """
+    # load meta & artifacts
+    meta_path = os.path.join(ARTIFACT_DIR, f"{usecase_name}_meta.json")
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Missing meta for {usecase_name} at {meta_path}. Train the usecase first.")
+    meta = json.load(open(meta_path))
+
+    # artifacts
+    bert = joblib.load(meta["bert_path"])
+    le = joblib.load(os.path.join(ARTIFACT_DIR, f"encoder_{usecase_name}_target.joblib"))
+    model_state = torch.load(meta["model_path"], map_location=DEVICE)
+
+    # prepare input text
+    input_text = " ".join(map(str, input_values))
+    input_emb = bert.encode([input_text], convert_to_numpy=True)[0]  # (D,)
+    input_emb_tensor = torch.tensor(input_emb, dtype=torch.float).to(DEVICE).unsqueeze(0)  # (1,D)
+
+    # rebuild graph & node embeddings from training df using same input field naming
+    # we expect df_train to have column f"{usecase_name}_input" (created by prepare phase earlier)
+    input_col = f"{usecase_name}_input"
+    if input_col in df_train.columns:
+        node_texts = df_train[input_col].astype(str).tolist()
+    else:
+        node_texts = df_train["campaign_name"].astype(str).tolist()
+    graph, node_embeddings = build_graph_from_node_texts(node_texts, bert)
+    node_embeddings_np = node_embeddings  # (N, D)
+    # find closest node index for context
+    node_idx_int = find_closest_node(input_emb, node_embeddings_np)
+    node_idx_tensor = torch.tensor([node_idx_int], dtype=torch.long).to(DEVICE)
+
+    # meta features: zeros unless you have real features
+    meta_feats = np.zeros((1, META_DIM), dtype=np.float32)
+    meta_tensor = torch.tensor(meta_feats, dtype=torch.float).to(DEVICE)
+
+    # instantiate model and load state
+    input_dim = input_emb.shape[0]
+    num_classes = meta["num_classes"]
+    model = AdvancedHybridModel(bert_dim=input_dim, meta_dim=META_DIM, gnn_in_dim=input_dim, gnn_hidden=256, shared_dim=512, num_classes=num_classes).to(DEVICE)
+    model.load_state_dict(model_state)
+    model.eval()
+
+    # forward to get logits and shared embedding
+    with torch.no_grad():
+        logits = model(input_emb_tensor, node_idx_tensor, graph.x.to(DEVICE), graph.edge_index.to(DEVICE), meta_tensor)
+        probs = F.softmax(logits, dim=1).cpu().numpy()[0]   # (num_classes,)
+        topk_idx = list(np.argsort(probs)[::-1][:K])
+        topk_scores = [float(probs[i]) for i in topk_idx]
+    # decode topk classes to JSON dicts
+    topk_jsons = [le.inverse_transform([int(i)])[0] for i in topk_idx]
+    topk_dicts = []
+    for s in topk_jsons:
+        try:
+            topk_dicts.append(json.loads(s))
+        except Exception:
+            topk_dicts.append({"value": s})
+
+    ml_prediction = topk_dicts[0] if topk_dicts else None
+    ml_topk = [{"score": topk_scores[i], "decoded": topk_dicts[i]} for i in range(len(topk_dicts))]
+
+    # recommendations: use aggregated stores
+    stores = build_recommendation_stores(df_train)
+    # pick store corresponding to this usecase if exists else any available
+    store = stores.get(usecase_name) or next(iter(stores.values()))
+    recs = {"top_campaigns": [], "top_products": [], "top_defect_clusters": []}
+    # compute shared embedding for query (we'll reuse model.get_shared_embedding using node_idx)
+    with torch.no_grad():
+        query_shared = model.get_shared_embedding(input_emb_tensor, node_idx_tensor, graph.x.to(DEVICE), graph.edge_index.to(DEVICE), meta_tensor)
+        query_np = query_shared.cpu().numpy()  # (1, D)
+    # campaign recommend
+    if store["campaign_mat"].shape[0] > 0:
+        sims = cosine_similarity(query_np, store["campaign_mat"])[0]
+        top_idx = np.argsort(sims)[::-1][:K]
+        recs["top_campaigns"] = [{"campaign": store["campaign_keys"][i], "score": float(sims[i])} for i in top_idx]
+    # product recommend
+    if store["product_mat"].shape[0] > 0:
+        sims = cosine_similarity(query_np, store["product_mat"])[0]
+        top_idx = np.argsort(sims)[::-1][:K]
+        recs["top_products"] = [{"product": store["product_keys"][i], "score": float(sims[i])} for i in top_idx]
+    # defect cluster recommend
+    if store["cluster_mat"].shape[0] > 0:
+        sims = cosine_similarity(query_np, store["cluster_mat"])[0]
+        top_idx = np.argsort(sims)[::-1][:K]
+        recs["top_defect_clusters"] = [{"cluster": store["cluster_keys"][i], "score": float(sims[i])} for i in top_idx]
+
+    # rule-based output: only meaningful when input contains a campaign_name
+    # try to parse campaign name from input_values
+    campaign_input = None
+    for v in input_values:
+        if isinstance(v, str) and len(v) > 2:
+            campaign_input = v
+            break
+    business_rules = load_business_rules(os.path.join(ARTIFACT_DIR, "business_rules.json"))
+    rule_result = fuzzy_lookup_campaign(campaign_input, business_rules) if campaign_input else None
+
+    return {
+        "rule_based_output": rule_result,
+        "ml_prediction": ml_prediction,
+        "ml_topk": ml_topk,
+        "recommendations": recs
+    }
+
+# ----------------------------
+# Helper to load business rules saved earlier
+# ----------------------------
+def load_business_rules(path: str):
+    if os.path.exists(path):
+        return json.load(open(path))
+    return {}
+
+# ----------------------------
+# Main execution: training all 4 usecases and demonstrating predictions
+# ----------------------------
+def main_train_and_demo():
+    # 0) Load data
+    df = pd.read_excel(DATA_PATH)
+    df.fillna("Unknown", inplace=True)
+
+    # 1) Extract business rules and save
+    rules = extract_business_rules_from_df(df)
+    with open(os.path.join(ARTIFACT_DIR, "business_rules.json"), "w") as f:
+        json.dump(rules, f, indent=2)
+    print("Business rules extracted and saved.")
+
+    # 2) Prepare input columns for each use case (text concatenation)
+    # Use Case 1: campaign_name -> defect details
+    df["uc1_input"] = df["campaign_name"].astype(str)
+
+    # Use Case 2: defect_summary -> defect details
+    df["uc2_input"] = df["defect_summary"].astype(str)
+
+    # Use Case 3: defect_type + defect_sub_type + asset_type -> campaign+product
+    df["uc3_input"] = (df["defect_type"].astype(str) + " " + df["defect_sub_type"].astype(str) + " " + df["asset_type"].astype(str))
+
+    # Use Case 4: campaign_name + defect_origin_team + product -> defect summaries + types
+    df["uc4_input"] = (df["campaign_name"].astype(str) + " " + df["defect_origin_team"].astype(str) + " " + df["product"].astype(str))
+
+    # 3) Train all usecases (each creates artifacts under ARTIFACT_DIR)
+    uc1_meta = train_usecase_hybrid(df, usecase_name="uc1", input_col="uc1_input",
+                                    target_cols=["product","asset_type","defect_type","defect_sub_type","defect_gravity","defect_origin_team","root_cause"],
+                                    epochs=TRAIN_EPOCHS)
+    uc2_meta = train_usecase_hybrid(df, usecase_name="uc2", input_col="uc2_input",
+                                    target_cols=["product","campaign_name","asset_type","defect_type","defect_sub_type","defect_gravity","defect_origin_team","root_cause"],
+                                    epochs=TRAIN_EPOCHS)
+    uc3_meta = train_usecase_hybrid(df, usecase_name="uc3", input_col="uc3_input",
+                                    target_cols=["campaign_name","product"],
+                                    epochs=TRAIN_EPOCHS)
+    uc4_meta = train_usecase_hybrid(df, usecase_name="uc4", input_col="uc4_input",
+                                    target_cols=["defect_summary","defect_type","defect_sub_type","defect_gravity","defect_origin_team","root_cause"],
+                                    epochs=TRAIN_EPOCHS)
+
+    # 4) Build recommendation stores once (saves nothing—kept in memory)
+    rec_stores = build_recommendation_stores(df)
+    print("Recommendation stores built for usecases:", list(rec_stores.keys()))
+
+    # 5) Demo predictions for each usecase (using the df as training df for graph & stores)
+    print("\n=== Demo Predictions ===")
+    print("UC1 ->", predict_usecase("uc1", ["Marketplace Campaign 2025"], df, K=5))
+    print("UC2 ->", predict_usecase("uc2", ["Broken link in rewards email"], df, K=5))
+    print("UC3 ->", predict_usecase("uc3", ["Content", "Grammar", "Email"], df, K=5))
+    print("UC4 ->", predict_usecase("uc4", ["Marketplace Campaign 2025", "Strategy Team", "Product A"], df, K=5))
+
+if __name__ == "__main__":
+    main_train_and_demo()
+

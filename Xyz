@@ -1,0 +1,122 @@
+import pandas as pd
+import json
+import os
+import re
+from sentence_transformers import SentenceTransformer, util
+from sklearn.feature_extraction.text import TfidfVectorizer
+from collections import Counter
+import nltk
+from nltk.corpus import stopwords
+
+# Make sure nltk stopwords are downloaded
+nltk.download("stopwords")
+stop_words = set(stopwords.words("english"))
+
+# Load pretrained sentence transformer (semantic embeddings)
+semantic_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# ========================
+# Utility Functions
+# ========================
+
+def clean_text(text):
+    """Lowercase, remove special chars, and stopwords"""
+    text = text.lower()
+    text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)  # remove special chars
+    words = [w for w in text.split() if w not in stop_words and len(w) > 2]
+    return " ".join(words)
+
+def extract_keywords(texts, top_n=5):
+    """
+    Extracts top-n keywords using TF-IDF + semantic similarity.
+    Returns dict {row_id: [keywords]}.
+    """
+    # Clean texts
+    cleaned = [clean_text(t) for t in texts]
+
+    # TF-IDF baseline
+    vectorizer = TfidfVectorizer(max_features=500, ngram_range=(1, 2))
+    X = vectorizer.fit_transform(cleaned)
+    tfidf_vocab = vectorizer.get_feature_names_out()
+
+    # Compute global word frequencies
+    word_freq = Counter(" ".join(cleaned).split())
+
+    keyword_dict = {}
+    for idx, text in enumerate(cleaned):
+        row_keywords = []
+        row_words = text.split()
+
+        # Score words by TF-IDF presence + frequency
+        scored = [(w, word_freq[w]) for w in row_words if w in tfidf_vocab]
+
+        # Sort & keep top_n
+        sorted_words = sorted(scored, key=lambda x: x[1], reverse=True)
+        row_keywords = [w for w, _ in sorted_words[:top_n]]
+
+        keyword_dict[idx] = row_keywords
+
+    return keyword_dict
+
+def semantic_group_keywords(keywords_dict, threshold=0.7):
+    """
+    Group keywords that are semantically similar using SBERT.
+    """
+    grouped_dict = {}
+    for row_id, keywords in keywords_dict.items():
+        embeddings = semantic_model.encode(keywords, convert_to_tensor=True)
+        groups = []
+        used = set()
+
+        for i, word in enumerate(keywords):
+            if word in used:
+                continue
+            group = [word]
+            for j in range(i + 1, len(keywords)):
+                sim = util.pytorch_cos_sim(embeddings[i], embeddings[j]).item()
+                if sim >= threshold:
+                    group.append(keywords[j])
+                    used.add(keywords[j])
+            groups.append(group)
+        grouped_dict[row_id] = groups
+    return grouped_dict
+
+
+# ========================
+# Main Preprocessing
+# ========================
+
+def preprocess_and_save(input_excel, output_excel, output_json):
+    df = pd.read_excel(input_excel)
+    df.fillna("Unknown", inplace=True)
+
+    # Combine defect summary + campaign name
+    combined_texts = df["defect_summary"].astype(str) + " " + df["campaign_name"].astype(str)
+
+    # Step 1: Extract keywords
+    keywords_dict = extract_keywords(combined_texts, top_n=7)
+
+    # Step 2: Semantic grouping
+    grouped_keywords = semantic_group_keywords(keywords_dict)
+
+    # Save keywords for manual labeling
+    os.makedirs(os.path.dirname(output_json), exist_ok=True)
+    with open(output_json, "w") as f:
+        json.dump(grouped_keywords, f, indent=4)
+
+    # Step 3: Save conditioned data in new Excel
+    df["keywords"] = df.index.map(lambda x: grouped_keywords.get(x, []))
+    df.to_excel(output_excel, index=False)
+
+    print(f"✅ Preprocessing complete.\nKeywords saved to {output_json}\nConditioned data saved to {output_excel}")
+
+
+# ========================
+# Run
+# ========================
+if __name__ == "__main__":
+    preprocess_and_save(
+        input_excel="campaign_defects.xlsx",
+        output_excel="artifacts/conditioned_campaign_defects.xlsx",
+        output_json="artifacts/keywords_for_labeling.json"
+    )

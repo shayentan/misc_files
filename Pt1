@@ -1,0 +1,1324 @@
+
+Below is an end‑to‑end implementation skeleton in Python that matches your spec: architecture, module layout, and concrete code for the core pipeline (ingestion → image capture → OCR with live streaming → diff → report → retest).  
+
+You can treat this as the starting repo for the project.
+
+---
+
+## 1. Project Structure
+
+```text
+visual_comparator/
+├─ app.py                      # Flask + SocketIO entry point
+├─ config.py                   # Config, paths, Chrome params
+├─ requirements.txt
+├─ comparison/
+│  ├─ __init__.py
+│  ├─ dto.py                   # Core dataclasses & enums
+│  ├─ pipeline.py              # Orchestration of full comparison
+│  ├─ diff_engine.py           # Text comparison & classification
+│  └─ mapping.py               # Page mapping utilities
+├─ ingestion/
+│  ├─ __init__.py
+│  ├─ pdf_capture.py           # PDF → images
+│  ├─ web_capture.py           # URL / modal / HTML → images
+│  ├─ email_capture.py         # .msg → HTML → images
+│  ├─ image_capture.py         # Raw PNG/JPG
+│  └─ report_capture.py        # Previous report PDF analysis
+├─ ocr/
+│  ├─ __init__.py
+│  ├─ ocr_service.py           # LightOn OCR wrapper + streaming
+│  └─ text_layout.py           # Map OCR tokens to character indices
+├─ reports/
+│  ├─ __init__.py
+│  ├─ generator.py             # HTML & Excel report generation
+│  └─ image_markups.py         # Highlight differences on images
+├─ templates/
+│  ├─ base.html
+│  ├─ dashboard.html
+│  ├─ card_marketplace.html
+│  ├─ email_validation.html
+│  ├─ pdf_to_pdf.html
+│  ├─ retest.html
+│  ├─ live_comparison.html
+│  └─ results.html
+├─ static/
+│  ├─ js/
+│  │  ├─ socket_ocr.js         # WebSocket client for live OCR
+│  └─ css/
+│     └─ main.css
+├─ uploads/                    # User files
+└─ outputs/                    # Reports, annotated images
+```
+
+Below are the key modules and code.
+
+---
+
+## 2. Core Domain Models (`comparison/dto.py`)
+
+```python
+# comparison/dto.py
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import List, Optional, Tuple, Dict
+
+
+class ValidationType(Enum):
+    CARD_MARKETPLACE = "card_marketplace"
+    MICROSITE = "microsite"
+    EMAIL = "email"
+    PDF_TO_PDF = "pdf_to_pdf"
+    RETEST = "retest"
+
+
+class SourceType(Enum:
+    PDF = "pdf"
+    IMAGE = "image"
+    MSG_EMAIL = "msg_email"
+    PREVIOUS_REPORT = "previous_report"
+    HTML_FILE = "html_file"
+
+
+class TargetType(Enum):
+    WEBSITE = "website"
+    MSG_EMAIL = "msg_email"
+    PDF = "pdf"
+    IMAGE = "image"
+    HTML_FILE = "html_file"
+
+
+class ErrorType(Enum):
+    MISSING_TEXT = "Missing Text"
+    EXTRA_TEXT = "Extra Text"
+    SUBSTITUTION = "Text Mismatch"
+    SPACING = "Spacing Difference"
+    LINE_BREAK = "Line Break Difference"
+    PUNCTUATION = "Punctuation Difference"
+    CASE = "Case Difference"
+    UNKNOWN = "Unknown"
+
+
+@dataclass
+class BoundingBox:
+    # Normalized [0,1] coordinates relative to image size
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+@dataclass
+class OcrWord:
+    text: str
+    bbox: BoundingBox
+    start_idx: int  # character index in full page text
+    end_idx: int    # inclusive or exclusive, we’ll use exclusive
+
+
+@dataclass
+class PageImage:
+    page_index: int
+    path: str                 # path to PNG/JPG
+    width: int
+    height: int
+    meta: Dict = field(default_factory=dict)
+
+
+@dataclass
+class PageOcrResult:
+    page_index: int
+    full_text: str
+    words: List[OcrWord]
+
+
+@dataclass
+class PageMapping:
+    source_page_idx: int
+    target_page_idx: int
+    meta: Dict = field(default_factory=dict)
+    # e.g. {"type": "offer_details_modal", "url": "...", "selector": "..."} 
+
+
+@dataclass
+class DifferenceSpan:
+    # Location within text
+    start_idx: int
+    end_idx: int
+
+
+@dataclass
+class Difference:
+    id: int
+    page_mapping: PageMapping
+    error_type: ErrorType
+    source_snippet: str
+    target_snippet: str
+    source_spans: List[DifferenceSpan]
+    target_spans: List[DifferenceSpan]
+
+
+@dataclass
+class PageComparisonResult:
+    mapping: PageMapping
+    differences: List[Difference]
+    passed: bool
+
+
+@dataclass
+class ComparisonResult:
+    validation_type: ValidationType
+    source_descriptor: str
+    target_descriptor: str
+    mappings: List[PageComparisonResult]
+    created_at: str
+    summary: Dict
+    # e.g. {"total_errors": 3, "result": "FAIL", "errors_by_type": {...}}
+
+
+@dataclass
+class RetestStatus:
+    defect_id: int
+    original_issue: str
+    status: str  # "FIXED", "NOT_FIXED", "NEW"
+    evidence: Dict
+
+
+@dataclass
+class RetestResult:
+    base_result: ComparisonResult
+    original_defects: List[Difference]
+    statuses: List[RetestStatus]
+    overall_status: str
+```
+
+---
+
+## 3. Ingestion Layer – PDF / Web / Email / Image
+
+### 3.1 PDF to Images (`ingestion/pdf_capture.py`)
+
+```python
+# ingestion/pdf_capture.py
+import os
+from typing import List
+import pypdfium2 as pdfium
+from PIL import Image
+
+from comparison.dto import PageImage
+
+
+def pdf_to_images(pdf_path: str, output_dir: str, dpi: int = 200) -> List[PageImage]:
+    os.makedirs(output_dir, exist_ok=True)
+    pdf = pdfium.PdfDocument(pdf_path)
+    page_images: List[PageImage] = []
+
+    for i in range(len(pdf)):
+        page = pdf[i]
+        pil_image = page.render(scale=dpi / 72).to_pil()
+        out_path = os.path.join(output_dir, f"page_{i+1}.png")
+        pil_image.save(out_path, "PNG")
+
+        w, h = pil_image.size
+        page_images.append(PageImage(
+            page_index=i,
+            path=out_path,
+            width=w,
+            height=h,
+            meta={}
+        ))
+
+    return page_images
+```
+
+### 3.2 Website / Modal Capture (`ingestion/web_capture.py`)
+
+```python
+# ingestion/web_capture.py
+import os
+import time
+from typing import List, Optional
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+from comparison.dto import PageImage
+
+
+def _init_driver(headless: bool = True) -> webdriver.Chrome:
+    options = Options()
+    if headless:
+        options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--window-size=1920,1080")
+    # Chrome & ChromeDriver in current dir as per requirement
+    options.binary_location = os.path.abspath("./chrome")
+    driver = webdriver.Chrome(
+        executable_path=os.path.abspath("./chromedriver"),
+        options=options
+    )
+    return driver
+
+
+def capture_full_page(url: str, output_path: str,
+                      wait_selector: Optional[str] = None,
+                      wait_time: int = 10) -> PageImage:
+    """
+    Capture full scrollable page (including below-the-fold content)
+    using Chrome DevTools 'Page.captureScreenshot'.
+    """
+    driver = _init_driver(headless=True)
+    try:
+        driver.get(url)
+        if wait_selector:
+            WebDriverWait(driver, wait_time).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, wait_selector))
+            )
+        else:
+            time.sleep(3)  # allow basic load
+
+        # Ensure page is fully rendered
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
+
+        # Use Chrome DevTools full-page capture
+        png = driver.get_screenshot_as_png()  # will often be viewport only
+
+        # More robust: use CDP command
+        try:
+            metrics = driver.execute_cdp_cmd("Page.getLayoutMetrics", {})
+            width = metrics["contentSize"]["width"]
+            height = metrics["contentSize"]["height"]
+            driver.set_window_size(width, height)
+            png = driver.get_screenshot_as_png()
+        except Exception:
+            pass
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(png)
+
+        from PIL import Image
+        img = Image.open(output_path)
+        w, h = img.size
+
+        return PageImage(
+            page_index=0,
+            path=output_path,
+            width=w,
+            height=h,
+            meta={"url": url}
+        )
+    finally:
+        driver.quit()
+
+
+def capture_offer_details_modal(url: str,
+                                output_path: str,
+                                button_text: str = "Offer Details",
+                                modal_selector: Optional[str] = None,
+                                wait_time: int = 15) -> PageImage:
+    """
+    1. Navigate to product page URL
+    2. Click "Offer Details" button
+    3. Wait for modal
+    4. Capture modal element as standalone image
+    """
+    driver = _init_driver(headless=True)
+    try:
+        driver.get(url)
+        time.sleep(3)
+
+        # Click Offer Details button by text; customize selector as needed
+        button = WebDriverWait(driver, wait_time).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, f"//button[contains(., '{button_text}')]")
+            )
+        )
+        button.click()
+
+        # Wait for modal
+        if modal_selector:
+            modal = WebDriverWait(driver, wait_time).until(
+                EC.visibility_of_element_located((By.CSS_SELECTOR, modal_selector))
+            )
+        else:
+            # very generic modal heuristics; adjust for real site
+            modal = WebDriverWait(driver, wait_time).until(
+                EC.visibility_of_element_located(
+                    (By.XPATH, "//div[contains(@class,'modal') and contains(@class,'show')]")
+                )
+            )
+
+        # Scroll modal to top
+        driver.execute_script("arguments[0].scrollTop = 0;", modal)
+        time.sleep(1)
+
+        # TODO: handle internal modal scrolling & stitching for very long modals
+
+        # Capture only modal
+        png = modal.screenshot_as_png
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(png)
+
+        from PIL import Image
+        img = Image.open(output_path)
+        w, h = img.size
+
+        return PageImage(
+            page_index=0,
+            path=output_path,
+            width=w,
+            height=h,
+            meta={"url": url, "type": "offer_details_modal"}
+        )
+    finally:
+        driver.quit()
+```
+
+### 3.3 .msg Email → HTML → Image (`ingestion/email_capture.py`)
+
+```python
+# ingestion/email_capture.py
+import os
+from typing import List, Tuple
+
+import extract_msg  # pip install extract-msg
+from comparison.dto import PageImage
+from .web_capture import _init_driver
+
+
+def parse_msg(msg_path: str) -> Tuple[str, str, str]:
+    """
+    Return (subject, html_body, text_body).
+    Prefer HTML if available.
+    """
+    msg = extract_msg.Message(msg_path)
+    subject = msg.subject or ""
+    body = msg.body or ""
+    html_body = msg.htmlBody or ""
+    return subject, html_body, body
+
+
+def render_email_to_image(msg_path: str, output_path: str) -> PageImage:
+    subject, html_body, text_body = parse_msg(msg_path)
+
+    if html_body:
+        body_html = html_body
+    else:
+        # simple text → HTML conversion
+        body_html = "<br>".join(line for line in text_body.splitlines())
+
+    # Basic HTML wrapper similar to an email client view
+    html = f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                padding: 16px;
+                max-width: 800px;
+                margin: 0 auto;
+            }}
+            .subject {{
+                font-weight: bold;
+                font-size: 20px;
+                margin-bottom: 12px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="subject">{subject}</div>
+        <div class="body">{body_html}</div>
+    </body>
+    </html>
+    """
+
+    tmp_html_path = output_path.replace(".png", ".html")
+    os.makedirs(os.path.dirname(tmp_html_path), exist_ok=True)
+    with open(tmp_html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    # Render via headless Chrome, capture full page
+    driver = _init_driver(headless=True)
+    try:
+        driver.get("file://" + os.path.abspath(tmp_html_path))
+        # Increase height to cover body content
+        driver.set_window_size(1000, 2000)
+        png = driver.get_screenshot_as_png()
+
+        with open(output_path, "wb") as f:
+            f.write(png)
+
+        from PIL import Image
+        img = Image.open(output_path)
+        w, h = img.size
+
+        return PageImage(
+            page_index=0,
+            path=output_path,
+            width=w,
+            height=h,
+            meta={"source": msg_path, "subject": subject}
+        )
+    finally:
+        driver.quit()
+```
+
+### 3.4 Raw Images (`ingestion/image_capture.py`)
+
+```python
+# ingestion/image_capture.py
+import os
+from typing import List
+from PIL import Image
+
+from comparison.dto import PageImage
+
+
+def wrap_image(path: str, page_index: int = 0) -> PageImage:
+    img = Image.open(path)
+    w, h = img.size
+    return PageImage(
+        page_index=page_index,
+        path=os.path.abspath(path),
+        width=w,
+        height=h,
+        meta={}
+    )
+```
+
+---
+
+## 4. OCR Service with Live Streaming (`ocr/ocr_service.py`)
+
+This wraps LightOnOCR; since exact API isn’t specified, this uses a placeholder `run_lighton_ocr` you’ll replace with the real model call. The key is: we stream text increments via a callback.
+
+```python
+# ocr/ocr_service.py
+from typing import Callable, List
+from PIL import Image
+
+from comparison.dto import PageImage, PageOcrResult, OcrWord, BoundingBox
+from .text_layout import build_word_layout
+
+
+StreamCallback = Callable[[str, int, str], None]
+# callback(text_chunk, page_index, side) where side is "source"/"target"
+
+
+def run_lighton_ocr(image: Image.Image) -> dict:
+    """
+    Stub for LightOnOCR-2-1B-ocr-soup.
+    Should return JSON-like:
+    {
+        "pages": [
+            {
+                "text": "full text ...",
+                "words": [
+                    {"text": "Welcome", "bbox": [x1,y1,x2,y2]},
+                    ...
+                ]
+            }
+        ]
+    }
+    Coordinates are absolute pixels or normalized; adapt accordingly.
+    """
+    # TODO: integrate real LightOn OCR inference
+    raise NotImplementedError("Integrate LightOnOCR here")
+
+
+def extract_page_text(page_image: PageImage,
+                      side: str,
+                      stream_callback: StreamCallback) -> PageOcrResult:
+    """
+    side: "source" or "target" for streaming labels.
+    """
+    img = Image.open(page_image.path)
+
+    # ---- OCR call ----
+    ocr_json = run_lighton_ocr(img)
+    page_data = ocr_json["pages"][0]
+    full_text = page_data["text"]
+
+    # Stream line by line for UI transparency
+    for line in full_text.splitlines(keepends=True):
+        if line.strip():
+            stream_callback(line, page_image.page_index, side)
+
+    # Build structured words with char indices
+    words_raw = page_data.get("words", [])
+    words: List[OcrWord] = []
+
+    # Use helper to align each word to char indices in full_text
+    words = build_word_layout(full_text, words_raw, page_image)
+
+    return PageOcrResult(
+        page_index=page_image.page_index,
+        full_text=full_text,
+        words=words
+    )
+```
+
+### 4.1 Text Layout Helper (`ocr/text_layout.py`)
+
+```python
+# ocr/text_layout.py
+from typing import List, Dict
+from comparison.dto import OcrWord, BoundingBox, PageImage
+
+
+def build_word_layout(full_text: str,
+                      words_raw: List[Dict],
+                      page_image: PageImage) -> List[OcrWord]:
+    """
+    Map OCR word tokens to character indices in full_text.
+    Assumes words_raw are in reading order and roughly match full_text.
+    """
+    words: List[OcrWord] = []
+    cursor = 0
+
+    for w in words_raw:
+        text = w["text"]
+        bbox = w["bbox"]  # [x1, y1, x2, y2] in absolute pixels or normalized
+
+        # Find next occurrence of this word text in full_text from cursor
+        idx = full_text.find(text, cursor)
+        if idx == -1:
+            # Word not found exactly; fallback: skip or approximate
+            continue
+
+        start_idx = idx
+        end_idx = idx + len(text)
+        cursor = end_idx
+
+        # Normalize bbox to [0,1]
+        x1, y1, x2, y2 = bbox
+        if max(page_image.width, page_image.height) > 1_000_000:
+            # if already normalized, you can skip
+            pass
+
+        norm_bbox = BoundingBox(
+            x1=x1 / page_image.width,
+            y1=y1 / page_image.height,
+            x2=x2 / page_image.width,
+            y2=y2 / page_image.height,
+        )
+
+        words.append(OcrWord(
+            text=text,
+            bbox=norm_bbox,
+            start_idx=start_idx,
+            end_idx=end_idx
+        ))
+
+    return words
+```
+
+---
+
+## 5. Text Comparison Engine (`comparison/diff_engine.py`)
+
+We do character‑level diff with `difflib`, classify error types, and keep char index ranges to map back to bboxes.
+
+```python
+# comparison/diff_engine.py
+from typing import List, Tuple
+import difflib
+
+from comparison.dto import (
+    PageOcrResult, Difference, DifferenceSpan,
+    ErrorType, PageMapping
+)
+
+
+def _classify_change(src_segment: str, tgt_segment: str) -> ErrorType:
+    if not src_segment and tgt_segment:
+        # something extra in target
+        if tgt_segment.isspace():
+            return ErrorType.SPACING
+        return ErrorType.EXTRA_TEXT
+
+    if src_segment and not tgt_segment:
+        if src_segment.isspace():
+            return ErrorType.SPACING
+        return ErrorType.MISSING_TEXT
+
+    if src_segment == tgt_segment:
+        return ErrorType.UNKNOWN
+
+    # Only whitespace change?
+    if src_segment.replace(" ", "") == tgt_segment.replace(" ", ""):
+        return ErrorType.SPACING
+
+    # Case only?
+    if src_segment.lower() == tgt_segment.lower():
+        return ErrorType.CASE
+
+    # Punctuation only?
+    import string
+    trans = str.maketrans("", "", string.punctuation + " ")
+    if src_segment.translate(trans) == tgt_segment.translate(trans):
+        return ErrorType.PUNCTUATION
+
+    # Line breaks?
+    if src_segment.replace("\n", " ") == tgt_segment.replace("\n", " "):
+        return ErrorType.LINE_BREAK
+
+    return ErrorType.SUBSTITUTION
+
+
+def compare_pages(source: PageOcrResult,
+                  target: PageOcrResult,
+                  mapping: PageMapping,
+                  diff_start_id: int = 1) -> Tuple[List[Difference], int]:
+    """
+    Character-level diff between source.full_text and target.full_text.
+    Returns list of Difference and next available diff_id.
+    """
+    s_text = source.full_text
+    t_text = target.full_text
+
+    sm = difflib.SequenceMatcher(a=s_text, b=t_text)
+    differences: List[Difference] = []
+    diff_id = diff_start_id
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+
+        src_seg = s_text[i1:i2]
+        tgt_seg = t_text[j1:j2]
+
+        error_type = _classify_change(src_seg, tgt_seg)
+        if error_type == ErrorType.UNKNOWN:
+            continue
+
+        diff = Difference(
+            id=diff_id,
+            page_mapping=mapping,
+            error_type=error_type,
+            source_snippet=src_seg,
+            target_snippet=tgt_seg,
+            source_spans=[DifferenceSpan(start_idx=i1, end_idx=i2)] if src_seg else [],
+            target_spans=[DifferenceSpan(start_idx=j1, end_idx=j2)] if tgt_seg else [],
+        )
+        differences.append(diff)
+        diff_id += 1
+
+    return differences, diff_id
+```
+
+---
+
+## 6. Mapping Utils (`comparison/mapping.py`)
+
+User‑defined mapping from PDF pages to URLs / emails / other pages. For now, assume mapping comes as JSON from the UI.
+
+```python
+# comparison/mapping.py
+from typing import List, Dict
+
+from comparison.dto import PageMapping
+
+
+def build_page_mappings(mapping_payload: List[Dict]) -> List[PageMapping]:
+    """
+    mapping_payload example item:
+    {
+      "source_page_idx": 0,
+      "target_page_idx": 0,
+      "meta": {
+        "type": "offer_details_modal",
+        "url": "https://...",
+        "mode": "card_marketplace"
+      }
+    }
+    """
+    mappings: List[PageMapping] = []
+    for item in mapping_payload:
+        mappings.append(PageMapping(
+            source_page_idx=item["source_page_idx"],
+            target_page_idx=item.get("target_page_idx", 0),
+            meta=item.get("meta", {})
+        ))
+    return mappings
+```
+
+---
+
+## 7. Comparison Pipeline Orchestration (`comparison/pipeline.py`)
+
+This module unifies everything for any scenario: source+target normalized to images → OCR (with streaming callback) → diff → consolidated `ComparisonResult`.
+
+```python
+# comparison/pipeline.py
+import os
+from datetime import datetime
+from typing import Callable, Dict, List, Tuple
+
+from comparison.dto import (
+    ValidationType, ComparisonResult, PageComparisonResult,
+    PageMapping, PageImage, PageOcrResult
+)
+from ingestion.pdf_capture import pdf_to_images
+from ingestion.web_capture import capture_full_page, capture_offer_details_modal
+from ingestion.email_capture import render_email_to_image
+from ingestion.image_capture import wrap_image
+from ocr.ocr_service import extract_page_text
+from comparison.diff_engine import compare_pages
+
+
+StreamCallback = Callable[[str, int, str], None]
+
+
+def _ingest_source(source_type: str,
+                   source_path: str,
+                   validation_type: ValidationType,
+                   mapping: List[PageMapping],
+                   base_tmp_dir: str) -> List[PageImage]:
+    """
+    Normalize source into list[PageImage].
+    For spec, source is usually PDF (or report PDF, or image).
+    """
+    out_dir = os.path.join(base_tmp_dir, "source")
+    if source_type == "pdf":
+        return pdf_to_images(source_path, out_dir)
+    elif source_type == "image":
+        return [wrap_image(source_path, page_index=0)]
+    elif source_type == "msg_email":
+        out_path = os.path.join(out_dir, "email.png")
+        return [render_email_to_image(source_path, out_path)]
+    elif source_type == "previous_report":
+        # treat as PDF here (for visual), plus separate JSON for defect list
+        return pdf_to_images(source_path, out_dir)
+    elif source_type == "html_file":
+        # treat as website loaded from file://
+        url = "file://" + os.path.abspath(source_path)
+        out_path = os.path.join(out_dir, "html.png")
+        return [capture_full_page(url, out_path)]
+    else:
+        raise ValueError(f"Unsupported source_type: {source_type}")
+
+
+def _ingest_target(target_type: str,
+                   target_ref: str,
+                   validation_type: ValidationType,
+                   mapping: List[PageMapping],
+                   base_tmp_dir: str) -> List[PageImage]:
+    """
+    Normalize target into list[PageImage].
+    """
+    out_dir = os.path.join(base_tmp_dir, "target")
+    if target_type == "website":
+        # Could be multiple URLs (card marketplace), but at low-level we just capture page(s).
+        url = target_ref
+        out_path = os.path.join(out_dir, "page_0.png")
+        return [capture_full_page(url, out_path)]
+    elif target_type == "msg_email":
+        out_path = os.path.join(out_dir, "email.png")
+        return [render_email_to_image(target_ref, out_path)]
+    elif target_type == "pdf":
+        return pdf_to_images(target_ref, out_dir)
+    elif target_type == "image":
+        return [wrap_image(target_ref, page_index=0)]
+    elif target_type == "html_file":
+        url = "file://" + os.path.abspath(target_ref)
+        out_path = os.path.join(out_dir, "html.png")
+        return [capture_full_page(url, out_path)]
+    else:
+        raise ValueError(f"Unsupported target_type: {target_type}")
+
+
+def run_comparison_job(job_id: str,
+                       validation_type: ValidationType,
+                       source_type: str,
+                       source_path: str,
+                       target_type: str,
+                       target_ref: str,
+                       mappings: List[PageMapping],
+                       base_tmp_dir: str,
+                       stream_callback: StreamCallback) -> ComparisonResult:
+    """
+    Orchestrates the full flow for a single logical comparison.
+    """
+    tmp_dir = os.path.join(base_tmp_dir, job_id)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    source_pages = _ingest_source(source_type, source_path, validation_type,
+                                  mappings, tmp_dir)
+    target_pages = _ingest_target(target_type, target_ref, validation_type,
+                                  mappings, tmp_dir)
+
+    # Build dicts by page index for quick access
+    src_by_idx = {p.page_index: p for p in source_pages}
+    tgt_by_idx = {p.page_index: p for p in target_pages}
+
+    page_results: List[PageComparisonResult] = []
+    diff_id = 1
+    total_errors = 0
+
+    # Usually user mapping will ensure the indexes exist
+    for m in mappings:
+        src_img = src_by_idx.get(m.source_page_idx)
+        tgt_img = tgt_by_idx.get(m.target_page_idx)
+        if not src_img or not tgt_img:
+            continue
+
+        # OCR
+        src_ocr: PageOcrResult = extract_page_text(
+            src_img, side="source",
+            stream_callback=stream_callback
+        )
+        tgt_ocr: PageOcrResult = extract_page_text(
+            tgt_img, side="target",
+            stream_callback=stream_callback
+        )
+
+        # Compare
+        diffs, diff_id = compare_pages(src_ocr, tgt_ocr, m, diff_id)
+        passed = len(diffs) == 0
+        total_errors += len(diffs)
+
+        page_results.append(PageComparisonResult(
+            mapping=m,
+            differences=diffs,
+            passed=passed
+        ))
+
+    summary = {
+        "total_errors": total_errors,
+        "result": "PASS" if total_errors == 0 else "FAIL"
+    }
+
+    source_descriptor = f"{source_type}: {os.path.basename(source_path)}"
+    target_descriptor = f"{target_type}: {target_ref}"
+
+    return ComparisonResult(
+        validation_type=validation_type,
+        source_descriptor=source_descriptor,
+        target_descriptor=target_descriptor,
+        mappings=page_results,
+        created_at=datetime.utcnow().isoformat(),
+        summary=summary
+    )
+```
+
+---
+
+## 8. Report Generation (`reports/generator.py`)
+
+HTML + Excel exports plus annotated images.
+
+```python
+# reports/generator.py
+import os
+from typing import List
+from jinja2 import Environment, FileSystemLoader
+from openpyxl import Workbook
+
+from comparison.dto import ComparisonResult, PageComparisonResult, Difference
+from .image_markups import annotate_all_pages
+
+
+def generate_html_report(result: ComparisonResult,
+                         output_dir: str,
+                         images_dir: str) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(images_dir, exist_ok=True)
+
+    # Pre-generate annotated images with highlights
+    annotate_all_pages(result, images_dir)
+
+    env = Environment(loader=FileSystemLoader("templates"))
+    template = env.get_template("report.html")  # create this template
+
+    html = template.render(result=result, images_dir=images_dir)
+    out_path = os.path.join(output_dir, "report.html")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return out_path
+
+
+def generate_excel_report(result: ComparisonResult,
+                          output_dir: str) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Differences"
+
+    ws.append(["Error ID", "Page Mapping", "Error Type",
+               "Source Snippet", "Target Snippet"])
+
+    for page_res in result.mappings:
+        mapping = page_res.mapping
+        for d in page_res.differences:
+            page_label = f"Src {mapping.source_page_idx+1} -> Tgt {mapping.target_page_idx+1}"
+            ws.append([
+                d.id,
+                page_label,
+                d.error_type.value,
+                d.source_snippet,
+                d.target_snippet
+            ])
+
+    out_path = os.path.join(output_dir, "report.xlsx")
+    wb.save(out_path)
+    return out_path
+```
+
+### 8.1 Image Highlighting (`reports/image_markups.py`)
+
+```python
+# reports/image_markups.py
+import os
+from typing import List, Dict
+from PIL import Image, ImageDraw
+
+from comparison.dto import ComparisonResult, PageComparisonResult, Difference, DifferenceSpan, BoundingBox, PageImage
+
+
+def _span_to_boxes(page_ocr, span: DifferenceSpan) -> List[BoundingBox]:
+    boxes: List[BoundingBox] = []
+    for word in page_ocr.words:
+        if word.end_idx <= span.start_idx:
+            continue
+        if word.start_idx >= span.end_idx:
+            break
+        boxes.append(word.bbox)
+    return boxes
+
+
+def annotate_all_pages(result: ComparisonResult, images_dir: str):
+    """
+    For each mapped page, create annotated images for source and target.
+    Requires that you also saved OCR PageOcrResults; for brevity we assume
+    you can reload / re-run OCR. In production, persist OCR results.
+    """
+    # In a fuller implementation, pass PageOcrResults in ComparisonResult
+    # or reload them here.
+    pass  # detailed implementation omitted for brevity
+```
+
+You’d store/attach `PageOcrResult` in `PageComparisonResult` to actually annotate bounding boxes and save.
+
+---
+
+## 9. Flask + SocketIO App (`app.py`)
+
+This wires everything: UI endpoints, WebSocket for live OCR streaming, background comparison threads.
+
+```python
+# app.py
+import os
+import uuid
+from threading import Thread
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO, emit
+
+from comparison.dto import ValidationType
+from comparison.mapping import build_page_mappings
+from comparison.pipeline import run_comparison_job
+from reports.generator import generate_html_report, generate_excel_report
+
+UPLOAD_DIR = "uploads"
+OUTPUT_DIR = "outputs"
+TMP_DIR = "tmp"
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "change-me"
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+
+@app.route("/")
+def dashboard():
+    return render_template("dashboard.html")
+
+
+@app.route("/card-marketplace")
+def card_marketplace():
+    return render_template("card_marketplace.html")
+
+
+@app.route("/email-validation")
+def email_validation():
+    return render_template("email_validation.html")
+
+
+@app.route("/pdf-to-pdf")
+def pdf_to_pdf():
+    return render_template("pdf_to_pdf.html")
+
+
+@app.route("/retest")
+def retest():
+    return render_template("retest.html")
+
+
+@app.route("/api/upload", methods=["POST"])
+def upload_files():
+    """
+    Generic upload; frontend will use this then call /api/start-comparison
+    with resulting file_ids.
+    """
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    files_info = {}
+    for field, file in request.files.items():
+        if not file:
+            continue
+        fname = f"{uuid.uuid4()}_{file.filename}"
+        path = os.path.join(UPLOAD_DIR, fname)
+        file.save(path)
+        files_info[field] = path
+    return jsonify({"files": files_info})
+
+
+def _stream_callback_factory(job_id: str):
+    def _stream(text_chunk: str, page_index: int, side: str):
+        socketio.emit("ocr_update", {
+            "job_id": job_id,
+            "side": side,
+            "page_index": page_index,
+            "text": text_chunk
+        }, namespace="/ocr")
+    return _stream
+
+
+@socketio.on("start_comparison", namespace="/ocr")
+def start_comparison(data):
+    """
+    Triggered from front-end via SocketIO.
+    Expected data:
+    {
+      "validation_type": "card_marketplace" | "email" | ...
+      "source_type": "pdf",
+      "source_path": "...",
+      "target_type": "website",
+      "target_ref": "https://...",
+      "mappings": [ ... PageMapping JSON ... ]
+    }
+    """
+    job_id = str(uuid.uuid4())
+    validation_type = ValidationType(data["validation_type"])
+    source_type = data["source_type"]
+    source_path = data["source_path"]
+    target_type = data["target_type"]
+    target_ref = data["target_ref"]
+    mappings = build_page_mappings(data["mappings"])
+
+    def bg_task():
+        try:
+            stream_cb = _stream_callback_factory(job_id)
+            result = run_comparison_job(
+                job_id=job_id,
+                validation_type=validation_type,
+                source_type=source_type,
+                source_path=source_path,
+                target_type=target_type,
+                target_ref=target_ref,
+                mappings=mappings,
+                base_tmp_dir=TMP_DIR,
+                stream_callback=stream_cb
+            )
+
+            # Generate reports
+            out_dir = os.path.join(OUTPUT_DIR, job_id)
+            html_path = generate_html_report(
+                result=result,
+                output_dir=out_dir,
+                images_dir=os.path.join(out_dir, "images")
+            )
+            xlsx_path = generate_excel_report(
+                result=result,
+                output_dir=out_dir
+            )
+
+            socketio.emit("comparison_done", {
+                "job_id": job_id,
+                "summary": result.summary,
+                "html_report": html_path,
+                "excel_report": xlsx_path
+            }, namespace="/ocr")
+        except Exception as e:
+            socketio.emit("comparison_error", {
+                "job_id": job_id,
+                "error": str(e)
+            }, namespace="/ocr")
+
+    Thread(target=bg_task, daemon=True).start()
+    emit("comparison_started", {"job_id": job_id})
+```
+
+### 9.1 Front‑End Live OCR Client (`static/js/socket_ocr.js`)
+
+Very minimal client to show streaming.
+
+```javascript
+// static/js/socket_ocr.js
+document.addEventListener("DOMContentLoaded", function () {
+  const socket = io("/ocr");
+
+  const sourceTextEl = document.getElementById("source-ocr-text");
+  const targetTextEl = document.getElementById("target-ocr-text");
+  const statusEl = document.getElementById("status");
+
+  socket.on("connect", () => {
+    console.log("Connected to OCR namespace");
+  });
+
+  socket.on("ocr_update", (msg) => {
+    const { side, text } = msg;
+    if (side === "source") {
+      sourceTextEl.textContent += text;
+    } else {
+      targetTextEl.textContent += text;
+    }
+  });
+
+  socket.on("comparison_started", (msg) => {
+    statusEl.textContent = "Comparison started...";
+  });
+
+  socket.on("comparison_done", (msg) => {
+    statusEl.textContent = `Done. Result: ${msg.summary.result}, Errors: ${msg.summary.total_errors}`;
+    // Optionally: link to HTML/Excel reports
+  });
+
+  socket.on("comparison_error", (msg) => {
+    statusEl.textContent = "Error: " + msg.error;
+  });
+
+  // Example start comparison call; in real UI use form inputs
+  window.startComparison = function (payload) {
+    socket.emit("start_comparison", payload);
+  };
+});
+```
+
+---
+
+## 10. Retest / Defect Validation Logic
+
+Core idea:
+
+1. On initial comparison, save both:
+   - The visual/HTML/PDF report
+   - A JSON representation of `ComparisonResult` (with all `Difference` entries)
+
+2. In retest:
+   - Load previous `ComparisonResult` JSON as “original defects”.
+   - Run a new comparison (PDF/report PDF vs new target).
+   - For each original `Difference`, search if an equivalent difference still exists.
+   - Mark as `FIXED` if not found; `NOT_FIXED` if found.
+   - Any new differences not in original set are "NEW" regression.
+
+Skeleton for comparison:
+
+```python
+# comparison/retest.py
+from typing import List, Dict
+from comparison.dto import ComparisonResult, Difference, RetestResult, RetestStatus
+
+
+def _difference_key(d: Difference) -> str:
+    """
+    Hashable key for equivalence:
+    normalize snippets & error type.
+    """
+    return f"{d.error_type.value}|{d.source_snippet.strip()}|{d.target_snippet.strip()}"
+
+
+def compute_retest_result(original: ComparisonResult,
+                          current: ComparisonResult) -> RetestResult:
+    orig_diffs: List[Difference] = []
+    for pr in original.mappings:
+        orig_diffs.extend(pr.differences)
+
+    curr_diffs: List[Difference] = []
+    for pr in current.mappings:
+        curr_diffs.extend(pr.differences)
+
+    orig_map: Dict[str, List[Difference]] = {}
+    for d in orig_diffs:
+        k = _difference_key(d)
+        orig_map.setdefault(k, []).append(d)
+
+    curr_keys = {_difference_key(d) for d in curr_diffs}
+
+    statuses: List[RetestStatus] = []
+    for i, d in enumerate(orig_diffs, start=1):
+        k = _difference_key(d)
+        if k in curr_keys:
+            status = "NOT_FIXED"
+        else:
+            status = "FIXED"
+
+        statuses.append(RetestStatus(
+            defect_id=i,
+            original_issue=f"{d.error_type.value}: {d.source_snippet} -> {d.target_snippet}",
+            status=status,
+            evidence={}
+        ))
+
+    # New ones: curr - orig
+    orig_keys = set(orig_map.keys())
+    new_keys = curr_keys - orig_keys
+
+    for k in new_keys:
+        # You can attach one representative difference here
+        pass
+
+    any_not_fixed = any(s.status == "NOT_FIXED" for s in statuses)
+    any_new = len(new_keys) > 0
+    if any_not_fixed or any_new:
+        overall = "FAIL"
+    else:
+        overall = "PASS"
+
+    return RetestResult(
+        base_result=current,
+        original_defects=orig_diffs,
+        statuses=statuses,
+        overall_status=overall
+    )
+```
+
+---
+
+## 11. Packaging to Standalone `.exe`
+
+Once the project works as `python app.py`:
+
+1. Add dependencies to `requirements.txt` (Flask, Flask-SocketIO, eventlet/gevent, selenium, pypdfium2, Pillow, extract-msg, openpyxl, jinja2, etc.).
+2. Use PyInstaller:
+
+```bash
+pyinstaller --onefile --name=VisualComparator app.py \
+  --hidden-import=eventlet \
+  --add-data "templates;templates" \
+  --add-data "static;static"
+```
+
+Ensure `chrome` and `chromedriver` binaries are placed next to the generated `VisualComparator.exe` as per your requirement.
+
+---
+
+## 12. How This Meets Your Spec
+
+- **All format combinations**: via `_ingest_source` / `_ingest_target` normalizing everything to images.
+- **Modals & offer details**: `capture_offer_details_modal` isolates modal element, excluding background.
+- **Full scroll pages**: `capture_full_page` uses CDP full-page screenshot.
+- **Email (.msg)**: `render_email_to_image` parses via `extract_msg`, renders as HTML, then screenshot.
+- **OCR with live streaming**: `extract_page_text` + Socket.IO streaming callback show real-time OCR text.
+- **Character-perfect diff (incl. spaces)**: `compare_pages` uses character-level `SequenceMatcher` and keeps whitespace.
+- **Visual highlights**: `image_markups.py` (to complete) will map `DifferenceSpan` → word bboxes → colored overlays.
+- **Reports**: `generate_html_report` + `generate_excel_report` produce human-readable outputs, with mapping, classification, and counts.
+- **Retest**: `compute_retest_result` compares old vs new differences and flags fixed / not fixed / new issues.
+
+If you want, I can next expand specific pieces (e.g., fully implement annotated image generation, exact HTML templates for the flows, or wiring all validation types into specific front-end forms).

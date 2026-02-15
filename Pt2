@@ -1,0 +1,948 @@
+
+Below are the expanded pieces: updated data model + pipeline (so you can annotate images), full image‑highlight implementation, basic HTML templates for the main flows (including live OCR streaming), and retest wiring (save/load JSON of results and compute FIXED/NOT_FIXED/NEW).
+
+I’ll show updated/extra files only; you can merge them into the skeleton from the previous answer.
+
+---
+
+## 1. Data Model & Pipeline Updates (to support image highlighting)
+
+### 1.1 Extend `PageComparisonResult` to hold images + OCR
+
+**`comparison/dto.py`** – update `PageComparisonResult`:
+
+```python
+# comparison/dto.py
+
+@dataclass
+class PageComparisonResult:
+    mapping: PageMapping
+    differences: List[Difference]
+    passed: bool
+
+    # NEW: needed for highlighting & report visuals
+    source_image: PageImage
+    target_image: PageImage
+    source_ocr: PageOcrResult
+    target_ocr: PageOcrResult
+```
+
+### 1.2 Save JSON representation of results
+
+Add simple JSON (de)serialization so you can reuse results for retest.
+
+**`reports/json_store.py`**:
+
+```python
+# reports/json_store.py
+import os
+import json
+from dataclasses import asdict
+from typing import Any
+
+from comparison.dto import ComparisonResult
+
+
+def save_result_json(result: ComparisonResult, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = asdict(result)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_result_json(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+```
+
+> For retest, you’ll reconstruct `ComparisonResult` from this JSON or just use the difference list parts needed for matching.
+
+### 1.3 Update pipeline to attach OCR+image objects to each page result
+
+**`comparison/pipeline.py`** – replace the core loop with this version:
+
+```python
+# comparison/pipeline.py  (inside run_comparison_job)
+
+    page_results: List[PageComparisonResult] = []
+    diff_id = 1
+    total_errors = 0
+
+    for m in mappings:
+        src_img = src_by_idx.get(m.source_page_idx)
+        tgt_img = tgt_by_idx.get(m.target_page_idx)
+        if not src_img or not tgt_img:
+            continue
+
+        # OCR
+        src_ocr: PageOcrResult = extract_page_text(
+            src_img, side="source", stream_callback=stream_callback
+        )
+        tgt_ocr: PageOcrResult = extract_page_text(
+            tgt_img, side="target", stream_callback=stream_callback
+        )
+
+        # Compare
+        diffs, diff_id = compare_pages(src_ocr, tgt_ocr, m, diff_id)
+        passed = len(diffs) == 0
+        total_errors += len(diffs)
+
+        page_results.append(PageComparisonResult(
+            mapping=m,
+            differences=diffs,
+            passed=passed,
+            source_image=src_img,
+            target_image=tgt_img,
+            source_ocr=src_ocr,
+            target_ocr=tgt_ocr,
+        ))
+```
+
+And keep the rest of `run_comparison_job` as before.
+
+---
+
+## 2. Image Highlight Implementation
+
+We now implement `annotate_all_pages` to draw colored rectangles over error spans on both source and target images.
+
+### 2.1 Bounding box aggregation helper
+
+**`reports/image_markups.py`** – full implementation:
+
+```python
+# reports/image_markups.py
+import os
+from typing import List
+from PIL import Image, ImageDraw
+
+from comparison.dto import (
+    ComparisonResult, PageComparisonResult, DifferenceSpan,
+    BoundingBox
+)
+
+
+def _span_to_boxes(page_ocr, span: DifferenceSpan) -> List[BoundingBox]:
+    """
+    For a given DifferenceSpan (char indices), find all words whose
+    [start_idx, end_idx) overlap that span, and collect their bboxes.
+    """
+    boxes: List[BoundingBox] = []
+    for word in page_ocr.words:
+        if word.end_idx <= span.start_idx:
+            continue
+        if word.start_idx >= span.end_idx:
+            break
+        boxes.append(word.bbox)
+    return boxes
+
+
+def _draw_boxes(img_path: str,
+                img_width: int,
+                img_height: int,
+                boxes: List[BoundingBox],
+                out_path: str,
+                color=(255, 0, 0),
+                width: int = 3) -> None:
+    img = Image.open(img_path).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    for b in boxes:
+        x1 = int(b.x1 * img_width)
+        y1 = int(b.y1 * img_height)
+        x2 = int(b.x2 * img_width)
+        y2 = int(b.y2 * img_height)
+        draw.rectangle([x1, y1, x2, y2], outline=color + (255,), width=width)
+
+    out = Image.alpha_composite(img, overlay)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out.convert("RGB").save(out_path, "PNG")
+
+
+def annotate_all_pages(result: ComparisonResult, images_dir: str):
+    """
+    For each PageComparisonResult in `result`, produce:
+      - source_annotated_<mapping_index>.png
+      - target_annotated_<mapping_index>.png
+    Highlight all differences as red rectangles.
+    """
+    os.makedirs(images_dir, exist_ok=True)
+
+    for idx, page_res in enumerate(result.mappings):
+        src_boxes: List[BoundingBox] = []
+        tgt_boxes: List[BoundingBox] = []
+
+        for diff in page_res.differences:
+            for span in diff.source_spans:
+                src_boxes.extend(_span_to_boxes(page_res.source_ocr, span))
+            for span in diff.target_spans:
+                tgt_boxes.extend(_span_to_boxes(page_res.target_ocr, span))
+
+        src_out = os.path.join(images_dir, f"source_annotated_{idx+1}.png")
+        tgt_out = os.path.join(images_dir, f"target_annotated_{idx+1}.png")
+
+        _draw_boxes(
+            img_path=page_res.source_image.path,
+            img_width=page_res.source_image.width,
+            img_height=page_res.source_image.height,
+            boxes=src_boxes,
+            out_path=src_out,
+            color=(255, 0, 0),
+        )
+        _draw_boxes(
+            img_path=page_res.target_image.path,
+            img_width=page_res.target_image.width,
+            img_height=page_res.target_image.height,
+            boxes=tgt_boxes,
+            out_path=tgt_out,
+            color=(255, 0, 0),
+        )
+
+        # Save paths in meta to use in templates, if desired
+        page_res.source_image.meta["annotated_path"] = src_out
+        page_res.target_image.meta["annotated_path"] = tgt_out
+```
+
+You can now use `result.mappings[i].source_image.meta["annotated_path"]` in HTML to show highlighted images.
+
+---
+
+## 3. Report HTML Template
+
+### 3.1 Example `report.html`
+
+Basic but matches your spec: summary, mapping, details, and annotated images.
+
+**`templates/report.html`**:
+
+```html
+{% extends "base.html" %}
+{% block title %}Comparison Report{% endblock %}
+
+{% block content %}
+<h1>COMPARISON REPORT</h1>
+
+<h2>Summary</h2>
+<table>
+  <tr><th>Result</th><td>{{ result.summary.result }}</td></tr>
+  <tr><th>Total Errors</th><td>{{ result.summary.total_errors }}</td></tr>
+  <tr><th>Validation Type</th><td>{{ result.validation_type.value }}</td></tr>
+  <tr><th>Source</th><td>{{ result.source_descriptor }}</td></tr>
+  <tr><th>Target</th><td>{{ result.target_descriptor }}</td></tr>
+  <tr><th>Date</th><td>{{ result.created_at }}</td></tr>
+</table>
+
+<hr>
+
+{% for page_res in result.mappings %}
+  <h3>Mapping {{ loop.index }}</h3>
+  <p>
+    Source Page: {{ page_res.mapping.source_page_idx + 1 }}<br>
+    Target Page: {{ page_res.mapping.target_page_idx + 1 }}<br>
+    Result: {{ "PASS" if page_res.passed else "FAIL" }}
+  </p>
+
+  {% if page_res.differences %}
+  <table border="1" cellspacing="0" cellpadding="4">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Error Type</th>
+        <th>Source Text</th>
+        <th>Target Text</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for d in page_res.differences %}
+      <tr>
+        <td>{{ d.id }}</td>
+        <td>{{ d.error_type.value }}</td>
+        <td><pre>{{ d.source_snippet }}</pre></td>
+        <td><pre>{{ d.target_snippet }}</pre></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p>No differences found.</p>
+  {% endif %}
+
+  <h4>Visual Comparison</h4>
+  <div style="display:flex; gap:20px; align-items:flex-start;">
+    <div>
+      <h5>Source</h5>
+      <img src="{{ images_dir }}/source_annotated_{{ loop.index }}.png"
+           alt="Source annotated {{ loop.index }}" style="max-width:400px;border:1px solid #ccc;">
+    </div>
+    <div>
+      <h5>Target</h5>
+      <img src="{{ images_dir }}/target_annotated_{{ loop.index }}.png"
+           alt="Target annotated {{ loop.index }}" style="max-width:400px;border:1px solid #ccc;">
+    </div>
+  </div>
+
+  <hr>
+{% endfor %}
+{% endblock %}
+```
+
+---
+
+## 4. Base & Main UI Templates
+
+You can keep UI minimal at first; later you can style it to match the wireframes.
+
+### 4.1 `base.html`
+
+**`templates/base.html`**:
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Visual Comparison Tool{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+  <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>Visual Comparison Tool</h1>
+  <nav>
+    <a href="{{ url_for('dashboard') }}">Dashboard</a> |
+    <a href="{{ url_for('card_marketplace') }}">Card Marketplace</a> |
+    <a href="{{ url_for('email_validation') }}">Emails</a> |
+    <a href="{{ url_for('pdf_to_pdf') }}">PDF ↔ PDF</a> |
+    <a href="{{ url_for('retest') }}">Retest</a>
+  </nav>
+  <hr>
+</header>
+
+<main>
+  {% block content %}{% endblock %}
+</main>
+
+</body>
+</html>
+```
+
+### 4.2 `dashboard.html`
+
+**`templates/dashboard.html`**:
+
+```html
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+
+<h2>Select Validation Type</h2>
+<div class="cards">
+  <a class="card" href="{{ url_for('card_marketplace') }}">Card Marketplace</a>
+  <a class="card" href="{{ url_for('pdf_to_pdf') }}">PDF to PDF</a>
+  <a class="card" href="{{ url_for('email_validation') }}">Emails</a>
+  <a class="card" href="{{ url_for('retest') }}">Retest / Defect Validation</a>
+</div>
+
+{% endblock %}
+```
+
+---
+
+## 5. Card Marketplace Flow UI (PDF → Website with Mapping)
+
+This is a simplified version of the wireframe; it:
+
+1. Lets user upload a PDF.
+2. Lets user enter one target URL and choose type (All / Category / Product / Modal).
+3. Builds a trivial mapping (for demo): PDF page 1 ↔ website page 1.
+4. Starts comparison via Socket.IO and shows live OCR.
+
+### 5.1 `card_marketplace.html`
+
+**`templates/card_marketplace.html`**:
+
+```html
+{% extends "base.html" %}
+{% block title %}Card Marketplace Validation{% endblock %}
+
+{% block content %}
+<h2>Card Marketplace Validation</h2>
+
+<form id="cm-form">
+  <fieldset>
+    <legend>Step 1: Upload Source PDF</legend>
+    <input type="file" id="source-pdf" accept=".pdf" required>
+  </fieldset>
+
+  <fieldset>
+    <legend>Step 2: Target Website</legend>
+    <label>URL:
+      <input type="url" id="target-url" required placeholder="https://example.com/cards/...">
+    </label>
+    <label>Type:
+      <select id="target-type">
+        <option value="all_cards">All Cards Page</option>
+        <option value="category">Category Page</option>
+        <option value="product">Product Page</option>
+        <option value="offer_modal">Offer Details Modal</option>
+      </select>
+    </label>
+  </fieldset>
+
+  <button type="submit">Start Comparison</button>
+</form>
+
+<hr>
+
+<h3>Live OCR Extraction</h3>
+<p id="status">Idle</p>
+<div style="display:flex; gap:20px;">
+  <div style="flex:1;">
+    <h4>Source (PDF)</h4>
+    <pre id="source-ocr-text" style="border:1px solid #ccc; padding:8px; height:200px; overflow:auto;"></pre>
+  </div>
+  <div style="flex:1;">
+    <h4>Target (Website)</h4>
+    <pre id="target-ocr-text" style="border:1px solid #ccc; padding:8px; height:200px; overflow:auto;"></pre>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='js/socket_ocr.js') }}"></script>
+<script>
+document.getElementById('cm-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+
+  const pdfFile = document.getElementById('source-pdf').files[0];
+  const url = document.getElementById('target-url').value;
+  const targetTypeInternal = document.getElementById('target-type').value;
+
+  if (!pdfFile) {
+    alert("Please upload a PDF");
+    return;
+  }
+
+  // 1) Upload PDF to /api/upload
+  const formData = new FormData();
+  formData.append('source_pdf', pdfFile);
+  const uploadResp = await fetch('/api/upload', {
+    method: 'POST',
+    body: formData
+  });
+  const uploadJson = await uploadResp.json();
+  const sourcePath = uploadJson.files['source_pdf'];
+
+  // 2) Build mapping payload – for demo, map page 0 ↔ target page 0
+  // In a more advanced UI, you'd let users map multiple pages.
+  const mappings = [{
+    source_page_idx: 0,
+    target_page_idx: 0,
+    meta: {
+      type: targetTypeInternal,
+      url: url
+    }
+  }];
+
+  // 3) Use global function from socket_ocr.js
+  window.startComparison({
+    validation_type: "card_marketplace",
+    source_type: "pdf",
+    source_path: sourcePath,
+    target_type: "website",
+    target_ref: url,
+    mappings: mappings
+  });
+});
+</script>
+{% endblock %}
+```
+
+This is intentionally minimal; you can extend it later to render PDF thumbnails and many mappings.
+
+---
+
+## 6. Live OCR Client JS (Expanded)
+
+Earlier we gave a minimal `socket_ocr.js`; extend it slightly to clear text buffers and handle multiple jobs.
+
+**`static/js/socket_ocr.js`**:
+
+```javascript
+// static/js/socket_ocr.js
+document.addEventListener("DOMContentLoaded", function () {
+  const socket = io("/ocr");
+
+  const sourceTextEl = document.getElementById("source-ocr-text");
+  const targetTextEl = document.getElementById("target-ocr-text");
+  const statusEl = document.getElementById("status");
+
+  let currentJobId = null;
+
+  socket.on("connect", () => {
+    console.log("Connected to OCR namespace");
+  });
+
+  socket.on("comparison_started", (msg) => {
+    currentJobId = msg.job_id;
+    if (statusEl) statusEl.textContent = "Comparison started...";
+    if (sourceTextEl) sourceTextEl.textContent = "";
+    if (targetTextEl) targetTextEl.textContent = "";
+  });
+
+  socket.on("ocr_update", (msg) => {
+    if (!currentJobId || msg.job_id !== currentJobId) return;
+
+    const { side, text } = msg;
+    if (side === "source" && sourceTextEl) {
+      sourceTextEl.textContent += text;
+    } else if (side === "target" && targetTextEl) {
+      targetTextEl.textContent += text;
+    }
+  });
+
+  socket.on("comparison_done", (msg) => {
+    if (!currentJobId || msg.job_id !== currentJobId) return;
+
+    if (statusEl) {
+      statusEl.textContent = `Done. Result: ${msg.summary.result}, Errors: ${msg.summary.total_errors}`;
+    }
+    console.log("Reports:", msg.html_report, msg.excel_report);
+  });
+
+  socket.on("comparison_error", (msg) => {
+    if (!currentJobId || msg.job_id !== currentJobId) return;
+    if (statusEl) statusEl.textContent = "Error: " + msg.error;
+  });
+
+  window.startComparison = function (payload) {
+    socket.emit("start_comparison", payload);
+  };
+});
+```
+
+---
+
+## 7. Email Validation Flow
+
+Very similar to card marketplace, but with PDF + .msg.
+
+### 7.1 Template
+
+**`templates/email_validation.html`**:
+
+```html
+{% extends "base.html" %}
+{% block title %}Email Validation{% endblock %}
+{% block content %}
+
+<h2>Email Validation</h2>
+
+<form id="email-form">
+  <fieldset>
+    <legend>Source PDF</legend>
+    <input type="file" id="source-pdf" accept=".pdf" required>
+  </fieldset>
+  <fieldset>
+    <legend>Target Email (.msg)</legend>
+    <input type="file" id="target-msg" accept=".msg" required>
+  </fieldset>
+  <button type="submit">Start Comparison</button>
+</form>
+
+<hr>
+
+<h3>Live OCR Extraction</h3>
+<p id="status">Idle</p>
+<div style="display:flex; gap:20px;">
+  <div style="flex:1;">
+    <h4>Source (PDF)</h4>
+    <pre id="source-ocr-text" style="border:1px solid #ccc; padding:8px; height:200px; overflow:auto;"></pre>
+  </div>
+  <div style="flex:1;">
+    <h4>Target (Email)</h4>
+    <pre id="target-ocr-text" style="border:1px solid #ccc; padding:8px; height:200px; overflow:auto;"></pre>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='js/socket_ocr.js') }}"></script>
+<script>
+document.getElementById('email-form').addEventListener('submit', async function(e) {
+  e.preventDefault();
+
+  const pdfFile = document.getElementById('source-pdf').files[0];
+  const msgFile = document.getElementById('target-msg').files[0];
+
+  if (!pdfFile || !msgFile) {
+    alert("Upload both PDF and .msg");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append('source_pdf', pdfFile);
+  formData.append('target_msg', msgFile);
+
+  const uploadResp = await fetch('/api/upload', { method: 'POST', body: formData });
+  const uploadJson = await uploadResp.json();
+
+  const sourcePath = uploadJson.files['source_pdf'];
+  const targetPath = uploadJson.files['target_msg'];
+
+  // Map first page of PDF to whole email
+  const mappings = [{
+    source_page_idx: 0,
+    target_page_idx: 0,
+    meta: { type: "email" }
+  }];
+
+  window.startComparison({
+    validation_type: "email",
+    source_type: "pdf",
+    source_path: sourcePath,
+    target_type: "msg_email",
+    target_ref: targetPath,
+    mappings: mappings
+  });
+});
+</script>
+
+{% endblock %}
+```
+
+---
+
+## 8. PDF ↔ PDF Flow
+
+**`templates/pdf_to_pdf.html`**:
+
+```html
+{% extends "base.html" %}
+{% block title %}PDF to PDF{% endblock %}
+{% block content %}
+
+<h2>PDF to PDF Comparison</h2>
+
+<form id="pdf2pdf-form">
+  <fieldset>
+    <legend>Source PDF</legend>
+    <input type="file" id="source-pdf" accept=".pdf" required>
+  </fieldset>
+  <fieldset>
+    <legend>Target PDF</legend>
+    <input type="file" id="target-pdf" accept=".pdf" required>
+  </fieldset>
+  <button type="submit">Start Comparison</button>
+</form>
+
+<hr>
+
+<h3>Live OCR Extraction</h3>
+<p id="status">Idle</p>
+<div style="display:flex; gap:20px;">
+  <div style="flex:1;">
+    <h4>Source PDF</h4>
+    <pre id="source-ocr-text" style="border:1px solid #ccc; padding:8px; height:200px; overflow:auto;"></pre>
+  </div>
+  <div style="flex:1;">
+    <h4>Target PDF</h4>
+    <pre id="target-ocr-text" style="border:1px solid #ccc; padding:8px; height:200px; overflow:auto;"></pre>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='js/socket_ocr.js') }}"></script>
+<script>
+document.getElementById('pdf2pdf-form').addEventListener('submit', async function(e) {
+  e.preventDefault();
+  const srcFile = document.getElementById('source-pdf').files[0];
+  const tgtFile = document.getElementById('target-pdf').files[0];
+  if (!srcFile || !tgtFile) { alert("Upload both PDFs"); return; }
+
+  const formData = new FormData();
+  formData.append('source_pdf', srcFile);
+  formData.append('target_pdf', tgtFile);
+  const uploadResp = await fetch('/api/upload', { method: 'POST', body: formData });
+  const uploadJson = await uploadResp.json();
+  const sourcePath = uploadJson.files['source_pdf'];
+  const targetPath = uploadJson.files['target_pdf'];
+
+  // Example: compare page 1 ↔ page 1 only. Extend as needed.
+  const mappings = [{
+    source_page_idx: 0,
+    target_page_idx: 0,
+    meta: { type: "pdf_to_pdf" }
+  }];
+
+  window.startComparison({
+    validation_type: "pdf_to_pdf",
+    source_type: "pdf",
+    source_path: sourcePath,
+    target_type: "pdf",
+    target_ref: targetPath,
+    mappings: mappings
+  });
+});
+</script>
+{% endblock %}
+```
+
+In production you’ll enumerate pages and let user map them flexibly.
+
+---
+
+## 9. Retest / Defect Validation Wiring
+
+### 9.1 Save JSON after each comparison
+
+Update `app.py` background task to call `save_result_json`.
+
+```python
+# app.py (bg_task inside start_comparison)
+
+    def bg_task():
+        try:
+            stream_cb = _stream_callback_factory(job_id)
+            result = run_comparison_job(
+                job_id=job_id,
+                validation_type=validation_type,
+                source_type=source_type,
+                source_path=source_path,
+                target_type=target_type,
+                target_ref=target_ref,
+                mappings=mappings,
+                base_tmp_dir=TMP_DIR,
+                stream_callback=stream_cb
+            )
+
+            out_dir = os.path.join(OUTPUT_DIR, job_id)
+            html_path = generate_html_report(
+                result=result,
+                output_dir=out_dir,
+                images_dir=os.path.join(out_dir, "images")
+            )
+            xlsx_path = generate_excel_report(result=result, output_dir=out_dir)
+
+            # NEW: store JSON for retest
+            from reports.json_store import save_result_json
+            json_path = os.path.join(out_dir, "result.json")
+            save_result_json(result, json_path)
+
+            socketio.emit("comparison_done", {
+                "job_id": job_id,
+                "summary": result.summary,
+                "html_report": html_path,
+                "excel_report": xlsx_path,
+                "json_result": json_path
+            }, namespace="/ocr")
+        except Exception as e:
+            socketio.emit("comparison_error", {
+                "job_id": job_id,
+                "error": str(e)
+            }, namespace="/ocr")
+```
+
+### 9.2 Retest template
+
+**`templates/retest.html`**:
+
+```html
+{% extends "base.html" %}
+{% block title %}Retest / Defect Validation{% endblock %}
+{% block content %}
+
+<h2>Retest / Defect Validation</h2>
+
+<form id="retest-form">
+  <fieldset>
+    <legend>Previous Report JSON</legend>
+    <p>Upload the JSON result file from a prior run (for now). You can also build tooling that extracts this from a report PDF.</p>
+    <input type="file" id="prev-json" accept=".json" required>
+  </fieldset>
+
+  <fieldset>
+    <legend>Updated Target</legend>
+    <label>Target Type:
+      <select id="target-type">
+        <option value="website">Website URL</option>
+        <option value="msg_email">.msg Email</option>
+        <option value="pdf">PDF</option>
+      </select>
+    </label>
+    <div id="target-file-wrapper">
+      <input type="file" id="target-file">
+    </div>
+    <div id="target-url-wrapper" style="display:none;">
+      <input type="url" id="target-url" placeholder="https://...">
+    </div>
+  </fieldset>
+
+  <button type="submit">Start Retest</button>
+</form>
+
+<hr>
+
+<p id="status">Idle</p>
+<pre id="result-text" style="border:1px solid #ccc; padding:8px; height:200px; overflow:auto;"></pre>
+
+<script>
+const targetTypeSelect = document.getElementById('target-type');
+const fileWrapper = document.getElementById('target-file-wrapper');
+const urlWrapper = document.getElementById('target-url-wrapper');
+
+targetTypeSelect.addEventListener('change', () => {
+  const val = targetTypeSelect.value;
+  if (val === 'website') {
+    fileWrapper.style.display = 'none';
+    urlWrapper.style.display = 'block';
+  } else {
+    fileWrapper.style.display = 'block';
+    urlWrapper.style.display = 'none';
+  }
+});
+
+document.getElementById('retest-form').addEventListener('submit', async function(e) {
+  e.preventDefault();
+
+  const prevJsonFile = document.getElementById('prev-json').files[0];
+  if (!prevJsonFile) { alert("Upload previous JSON."); return; }
+
+  const targetType = targetTypeSelect.value;
+  let targetRef = null;
+  const formData = new FormData();
+  formData.append('prev_json', prevJsonFile);
+
+  if (targetType === 'website') {
+    targetRef = document.getElementById('target-url').value;
+    if (!targetRef) { alert("Enter target URL"); return; }
+  } else {
+    const targetFile = document.getElementById('target-file').files[0];
+    if (!targetFile) { alert("Upload target file"); return; }
+    formData.append('target_file', targetFile);
+  }
+
+  const uploadResp = await fetch('/api/retest', {
+    method: 'POST',
+    body: formData
+  });
+  const respJson = await uploadResp.json();
+
+  document.getElementById('status').textContent = "Retest complete: " + respJson.overall_status;
+  document.getElementById('result-text').textContent = JSON.stringify(respJson, null, 2);
+});
+</script>
+
+{% endblock %}
+```
+
+### 9.3 Retest API endpoint
+
+We reuse the earlier `compute_retest_result`.
+
+**`comparison/retest.py`** (given earlier) and hook it in `app.py`:
+
+```python
+# app.py
+
+from flask import send_file
+from comparison.retest import compute_retest_result
+from reports.json_store import load_result_json
+from comparison.dto import ComparisonResult  # you might reconstruct manually
+
+
+@app.route("/api/retest", methods=["POST"])
+def api_retest():
+    """
+    Demo version: expects uploaded previous JSON + new target file (or website URL provided separately).
+    To keep this concise, we'll handle only PDF target here; website/email can be added similarly.
+    """
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    prev_json_file = request.files.get("prev_json")
+    target_file = request.files.get("target_file")
+
+    if not prev_json_file:
+        return jsonify({"error": "prev_json required"}), 400
+
+    prev_json_path = os.path.join(UPLOAD_DIR, f"prev_{uuid.uuid4()}.json")
+    prev_json_file.save(prev_json_path)
+    prev_data = load_result_json(prev_json_path)
+
+    # TODO: reconstruct ComparisonResult from prev_data if you need all fields;
+    # for re-test we mostly need original differences. For brevity we treat
+    # prev_data as compatible with comparison.retest functions.
+
+    # For demo: assume we re-run same validation_type, source_type etc.
+    # In production you'll persist these in the JSON and reuse them.
+    # This is just the skeleton hook.
+    return jsonify({
+        "overall_status": "TODO",
+        "message": "Wire full retest by reconstructing ComparisonResult and calling compute_retest_result."
+    })
+```
+
+You already have `compute_retest_result`; once you decide how to reconstruct `ComparisonResult` from stored JSON, you can complete this.
+
+---
+
+## 10. LightOn OCR Integration Stub
+
+Right now `run_lighton_ocr` is a stub. The exact call will depend on how you access LightOnOCR‑2‑1B‑ocr‑soup (local model, API, HuggingFace Inference, etc.).
+
+Skeleton if it were a REST API:
+
+```python
+# ocr/ocr_service.py
+import requests
+import base64
+from io import BytesIO
+
+LIGHTON_ENDPOINT = "https://your-lighton-endpoint/ocr"
+
+def run_lighton_ocr(image: Image.Image) -> dict:
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    payload = {"image": img_b64}
+    resp = requests.post(LIGHTON_ENDPOINT, json=payload)
+    resp.raise_for_status()
+    return resp.json()
+```
+
+Then adapt `build_word_layout` to the exact response format.
+
+---
+
+## 11. Packaging as `.exe`
+
+Once all pieces work:
+
+1. Install deps:
+
+```bash
+pip install -r requirements.txt
+```
+
+2. Run locally:
+
+```bash
+export FLASK_APP=app.py
+flask run
+```
+
+3. Package (assuming you’ve placed `chrome` and `chromedriver` in the project root):
+
+```bash
+pyinstaller --onefile app.py \
+  --name VisualComparator \
+  --hidden-import=eventlet \
+  --add-data "templates;templates" \
+  --add-data "static;static"
+```
+
+The produced `VisualComparator.exe` should be placed in the same folder as `chrome` and `chromedriver`.
+
+---
+
+If you want, next I can:
+
+- Flesh out a more sophisticated mapping UI (thumbnail‑based, multiple URL+page mappings).
+- Add explicit modal capture options (e.g., when `meta.type == "offer_modal"` use `capture_offer_details_modal` instead of `capture_full_page`).
+- Complete retest endpoint using real JSON→`ComparisonResult` reconstruction and return a detailed defect list with FIXED/NOT_FIXED/NEW.

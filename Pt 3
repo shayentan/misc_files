@@ -1,0 +1,809 @@
+
+Here are the concrete upgrades you asked for:
+
+- Advanced card‑marketplace mapping UI (multi‑row, per‑URL/per‑type, incl. modals)
+- Explicit modal capture in the pipeline based on mapping metadata
+- A complete retest endpoint that runs a new comparison and returns FIXED / NOT_FIXED / NEW statuses based on the original JSON result
+
+I’ll only show updated / new files and clearly mark changes so you can merge them into the previous skeleton.
+
+---
+
+## 1. JSON Storage: Enum‑safe Save/Load
+
+Update JSON save so Enums serialize cleanly.
+
+### `reports/json_store.py`
+
+```python
+# reports/json_store.py
+import os
+import json
+from dataclasses import asdict
+from enum import Enum
+from typing import Any
+
+from comparison.dto import ComparisonResult
+
+
+def _json_default(obj):
+    if isinstance(obj, Enum):
+        return obj.value
+    return str(obj)
+
+
+def save_result_json(result: ComparisonResult, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = asdict(result)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=_json_default)
+
+
+def load_result_json(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+```
+
+---
+
+## 2. DTO Updates for Retest
+
+Change `RetestResult` to use generic dicts for original defects (we only need basic info).
+
+### `comparison/dto.py` (add `Dict` import and update `RetestResult`)
+
+At top:
+
+```python
+from typing import List, Optional, Tuple, Dict
+```
+
+Update `RetestResult`:
+
+```python
+@dataclass
+class RetestResult:
+    base_result: ComparisonResult
+    # Normalized original defects (dicts: error_type, source_snippet, target_snippet, key)
+    original_defects: List[Dict]
+    statuses: List[RetestStatus]   # includes FIXED, NOT_FIXED, NEW
+    overall_status: str
+```
+
+---
+
+## 3. Retest Logic: Compare Original JSON vs New Result
+
+This version works directly on the JSON dict from `save_result_json` and on the current `ComparisonResult` object.
+
+### `comparison/retest.py`
+
+```python
+# comparison/retest.py
+from typing import Dict, List
+
+from comparison.dto import ComparisonResult, RetestResult, RetestStatus
+
+
+def _make_key(error_type: str, src: str, tgt: str) -> str:
+    return f"{error_type}|{src.strip()}|{tgt.strip()}"
+
+
+def _normalize_original_diffs(original_data: Dict) -> List[Dict]:
+    """
+    Flatten original ComparisonResult JSON (dict) into a list of normalized differences.
+    """
+    diffs: List[Dict] = []
+    for pr in original_data.get("mappings", []):
+        for d in pr.get("differences", []):
+            et = d.get("error_type", "")
+            src = d.get("source_snippet", "")
+            tgt = d.get("target_snippet", "")
+            key = _make_key(et, src, tgt)
+            diffs.append({
+                "key": key,
+                "error_type": et,
+                "source_snippet": src,
+                "target_snippet": tgt,
+            })
+    return diffs
+
+
+def _normalize_current_diffs(current: ComparisonResult) -> List[Dict]:
+    """
+    Flatten current ComparisonResult object into a list of normalized differences.
+    """
+    diffs: List[Dict] = []
+    for pr in current.mappings:
+        for d in pr.differences:
+            et = d.error_type.value
+            src = d.source_snippet
+            tgt = d.target_snippet
+            key = _make_key(et, src, tgt)
+            diffs.append({
+                "key": key,
+                "error_type": et,
+                "source_snippet": src,
+                "target_snippet": tgt,
+            })
+    return diffs
+
+
+def compute_retest_result_from_dict(original_data: Dict,
+                                    current: ComparisonResult) -> RetestResult:
+    orig_norm = _normalize_original_diffs(original_data)
+    curr_norm = _normalize_current_diffs(current)
+
+    orig_keys = {d["key"] for d in orig_norm}
+    curr_keys = {d["key"] for d in curr_norm}
+
+    statuses: List[RetestStatus] = []
+    new_issue_statuses: List[RetestStatus] = []
+
+    # Map for quick lookup
+    orig_by_key = {d["key"]: d for d in orig_norm}
+    curr_by_key = {d["key"]: d for d in curr_norm}
+
+    # FIXED / NOT_FIXED for original defects
+    for idx, d in enumerate(orig_norm, start=1):
+        key = d["key"]
+        still_present = key in curr_keys
+        status = "NOT_FIXED" if still_present else "FIXED"
+        issue_text = f"{d['error_type']}: {d['source_snippet']} -> {d['target_snippet']}"
+        statuses.append(RetestStatus(
+            defect_id=idx,
+            original_issue=issue_text,
+            status=status,
+            evidence={}
+        ))
+
+    # NEW issues: present now but not in original
+    new_keys = curr_keys - orig_keys
+    for key in new_keys:
+        d = curr_by_key[key]
+        issue_text = f"{d['error_type']}: {d['source_snippet']} -> {d['target_snippet']}"
+        new_issue_statuses.append(RetestStatus(
+            defect_id=-1,
+            original_issue=issue_text,
+            status="NEW",
+            evidence={}
+        ))
+
+    any_not_fixed = any(s.status == "NOT_FIXED" for s in statuses)
+    any_new = len(new_issue_statuses) > 0
+    overall = "FAIL" if any_not_fixed or any_new else "PASS"
+
+    return RetestResult(
+        base_result=current,
+        original_defects=orig_norm,
+        statuses=statuses + new_issue_statuses,
+        overall_status=overall
+    )
+```
+
+---
+
+## 4. Card Marketplace: Per‑Mapping Modal / URL Capture
+
+We specialize `run_comparison_job` so `ValidationType.CARD_MARKETPLACE` uses mapping meta (`meta.type`, `meta.url`) to drive Selenium capture for each mapping row.
+
+### `comparison/pipeline.py` (key changes only)
+
+At top, add imports:
+
+```python
+from ingestion.web_capture import capture_full_page, capture_offer_details_modal
+```
+
+Replace the body of `run_comparison_job` with this version:
+
+```python
+def run_comparison_job(job_id: str,
+                       validation_type: ValidationType,
+                       source_type: str,
+                       source_path: str,
+                       target_type: str,
+                       target_ref: str,
+                       mappings: List[PageMapping],
+                       base_tmp_dir: str,
+                       stream_callback: StreamCallback) -> ComparisonResult:
+    tmp_dir = os.path.join(base_tmp_dir, job_id)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    # Source normalization
+    source_pages = _ingest_source(source_type, source_path, validation_type,
+                                  mappings, tmp_dir)
+    src_by_idx = {p.page_index: p for p in source_pages}
+
+    page_results: List[PageComparisonResult] = []
+    diff_id = 1
+    total_errors = 0
+
+    if validation_type == ValidationType.CARD_MARKETPLACE:
+        # Per-mapping website/modal capture
+        target_base_dir = os.path.join(tmp_dir, "target")
+        os.makedirs(target_base_dir, exist_ok=True)
+
+        for i, m in enumerate(mappings):
+            src_img = src_by_idx.get(m.source_page_idx)
+            if not src_img:
+                continue
+
+            meta = m.meta or {}
+            url = meta.get("url", target_ref)
+            page_type = meta.get("type", "product")  # all_cards / category / product / offer_modal
+
+            if page_type == "offer_modal":
+                out_path = os.path.join(target_base_dir, f"modal_{i+1}.png")
+                tgt_img = capture_offer_details_modal(
+                    url=url,
+                    output_path=out_path,
+                    button_text=meta.get("button_text", "Offer Details"),
+                    modal_selector=meta.get("modal_selector"),
+                    wait_time=int(meta.get("wait_time", 15))
+                )
+            else:
+                out_path = os.path.join(target_base_dir, f"page_{i+1}.png")
+                tgt_img = capture_full_page(
+                    url=url,
+                    output_path=out_path,
+                    wait_selector=meta.get("wait_selector"),
+                    wait_time=int(meta.get("wait_time", 10))
+                )
+
+            # OCR
+            src_ocr: PageOcrResult = extract_page_text(
+                src_img, side="source", stream_callback=stream_callback
+            )
+            tgt_ocr: PageOcrResult = extract_page_text(
+                tgt_img, side="target", stream_callback=stream_callback
+            )
+
+            # Diff
+            diffs, diff_id = compare_pages(src_ocr, tgt_ocr, m, diff_id)
+            passed = len(diffs) == 0
+            total_errors += len(diffs)
+
+            page_results.append(PageComparisonResult(
+                mapping=m,
+                differences=diffs,
+                passed=passed,
+                source_image=src_img,
+                target_image=tgt_img,
+                source_ocr=src_ocr,
+                target_ocr=tgt_ocr,
+            ))
+
+    else:
+        # Generic path (PDF↔PDF, Email, Microsite, etc.)
+        target_pages = _ingest_target(target_type, target_ref, validation_type,
+                                      mappings, tmp_dir)
+        tgt_by_idx = {p.page_index: p for p in target_pages}
+
+        for m in mappings:
+            src_img = src_by_idx.get(m.source_page_idx)
+            tgt_img = tgt_by_idx.get(m.target_page_idx)
+            if not src_img or not tgt_img:
+                continue
+
+            src_ocr: PageOcrResult = extract_page_text(
+                src_img, side="source", stream_callback=stream_callback
+            )
+            tgt_ocr: PageOcrResult = extract_page_text(
+                tgt_img, side="target", stream_callback=stream_callback
+            )
+
+            diffs, diff_id = compare_pages(src_ocr, tgt_ocr, m, diff_id)
+            passed = len(diffs) == 0
+            total_errors += len(diffs)
+
+            page_results.append(PageComparisonResult(
+                mapping=m,
+                differences=diffs,
+                passed=passed,
+                source_image=src_img,
+                target_image=tgt_img,
+                source_ocr=src_ocr,
+                target_ocr=tgt_ocr,
+            ))
+
+    summary = {
+        "total_errors": total_errors,
+        "result": "PASS" if total_errors == 0 else "FAIL"
+    }
+
+    source_descriptor = f"{source_type}: {os.path.basename(source_path)}"
+    target_descriptor = f"{target_type}: {target_ref}"
+
+    return ComparisonResult(
+        validation_type=validation_type,
+        source_descriptor=source_descriptor,
+        target_descriptor=target_descriptor,
+        mappings=page_results,
+        created_at=datetime.utcnow().isoformat(),
+        summary=summary
+    )
+```
+
+---
+
+## 5. Advanced Card Marketplace Mapping UI
+
+This UI:
+
+- Uploads the PDF once and gets the page count.
+- Lets you add multiple mapping rows: each row has:
+  - PDF page dropdown
+  - URL input
+  - Type: All Cards / Category / Product / Offer Details Modal
+- On submit, sends `mappings` with `meta.url` and `meta.type` to Socket.IO.
+
+### `templates/card_marketplace.html` (full revised)
+
+```html
+{% extends "base.html" %}
+{% block title %}Card Marketplace Validation{% endblock %}
+
+{% block content %}
+<h2>Card Marketplace Validation</h2>
+
+<form id="cm-form">
+  <fieldset>
+    <legend>Step 1: Upload Source PDF</legend>
+    <input type="file" id="source-pdf" accept=".pdf" required>
+    <button type="button" id="load-pages-btn">Load Pages</button>
+    <span id="pages-info"></span>
+  </fieldset>
+
+  <fieldset>
+    <legend>Step 2: Page Mappings</legend>
+    <p>Create mappings from PDF pages to website URLs (including Offer Details modals).</p>
+    <table id="mapping-table" border="1" cellspacing="0" cellpadding="4">
+      <thead>
+        <tr>
+          <th>Source PDF Page</th>
+          <th>Target URL</th>
+          <th>Type</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="mapping-body">
+      </tbody>
+    </table>
+    <button type="button" id="add-mapping-btn">+ Add Mapping</button>
+  </fieldset>
+
+  <button type="submit">Start Comparison</button>
+</form>
+
+<hr>
+
+<h3>Live OCR Extraction</h3>
+<p id="status">Idle</p>
+<div style="display:flex; gap:20px;">
+  <div style="flex:1;">
+    <h4>Source (PDF)</h4>
+    <pre id="source-ocr-text" style="border:1px solid #ccc; padding:8px; height:200px; overflow:auto;"></pre>
+  </div>
+  <div style="flex:1;">
+    <h4>Target (Website / Modal)</h4>
+    <pre id="target-ocr-text" style="border:1px solid #ccc; padding:8px; height:200px; overflow:auto;"></pre>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='js/socket_ocr.js') }}"></script>
+<script>
+let pdfPageCount = 0;
+let sourcePath = null;
+
+function addMappingRow(sourcePageDefault, urlDefault, typeDefault) {
+  const body = document.getElementById('mapping-body');
+  const tr = document.createElement('tr');
+
+  const tdPage = document.createElement('td');
+  const select = document.createElement('select');
+  select.className = "source-page-select";
+  for (let i = 1; i <= pdfPageCount; i++) {
+    const opt = document.createElement('option');
+    opt.value = i - 1; // zero-based
+    opt.textContent = "Page " + i;
+    if (i - 1 === sourcePageDefault) opt.selected = true;
+    select.appendChild(opt);
+  }
+  tdPage.appendChild(select);
+
+  const tdUrl = document.createElement('td');
+  const urlInput = document.createElement('input');
+  urlInput.type = 'url';
+  urlInput.size = 40;
+  urlInput.value = urlDefault || "";
+  tdUrl.appendChild(urlInput);
+
+  const tdType = document.createElement('td');
+  const typeSelect = document.createElement('select');
+  typeSelect.innerHTML = `
+    <option value="all_cards">All Cards Page</option>
+    <option value="category">Category Page</option>
+    <option value="product" selected>Product Page</option>
+    <option value="offer_modal">Offer Details Modal</option>
+  `;
+  if (typeDefault) typeSelect.value = typeDefault;
+  tdType.appendChild(typeSelect);
+
+  const tdActions = document.createElement('td');
+  const delBtn = document.createElement('button');
+  delBtn.type = "button";
+  delBtn.textContent = "Remove";
+  delBtn.onclick = () => tr.remove();
+  tdActions.appendChild(delBtn);
+
+  tr.appendChild(tdPage);
+  tr.appendChild(tdUrl);
+  tr.appendChild(tdType);
+  tr.appendChild(tdActions);
+
+  body.appendChild(tr);
+}
+
+document.getElementById('load-pages-btn').addEventListener('click', async function() {
+  const file = document.getElementById('source-pdf').files[0];
+  if (!file) { alert("Upload PDF first."); return; }
+
+  // Get PDF page count
+  const formData = new FormData();
+  formData.append('pdf', file);
+  const resp = await fetch('/api/pdf-info', { method: 'POST', body: formData });
+  const data = await resp.json();
+  pdfPageCount = data.pages;
+  document.getElementById('pages-info').textContent = "Pages: " + pdfPageCount;
+
+  // Upload PDF once for use in comparison
+  const upForm = new FormData();
+  upForm.append('source_pdf', file);
+  const uploadResp = await fetch('/api/upload', { method: 'POST', body: upForm });
+  const uploadJson = await uploadResp.json();
+  sourcePath = uploadJson.files['source_pdf'];
+
+  // One default mapping row: Page 1, empty URL, Product
+  document.getElementById('mapping-body').innerHTML = "";
+  addMappingRow(0, "", "product");
+});
+
+document.getElementById('add-mapping-btn').addEventListener('click', function() {
+  if (!pdfPageCount) { alert("Load PDF pages first."); return; }
+  addMappingRow(0, "", "product");
+});
+
+document.getElementById('cm-form').addEventListener('submit', function(e) {
+  e.preventDefault();
+  if (!pdfPageCount || !sourcePath) {
+    alert("Upload and load PDF pages first.");
+    return;
+  }
+
+  const rows = document.querySelectorAll('#mapping-body tr');
+  if (!rows.length) { alert("Add at least one mapping."); return; }
+
+  const mappings = [];
+  rows.forEach((tr) => {
+    const pageIdx = parseInt(tr.querySelector('.source-page-select').value, 10);
+    const url = tr.querySelector('input[type="url"]').value;
+    const type = tr.querySelector('td:nth-child(3) select').value;
+    if (!url) return; // skip incomplete rows
+
+    mappings.push({
+      source_page_idx: pageIdx,
+      target_page_idx: 0,
+      meta: { url: url, type: type }
+    });
+  });
+
+  if (!mappings.length) {
+    alert("No valid mappings defined.");
+    return;
+  }
+
+  window.startComparison({
+    validation_type: "card_marketplace",
+    source_type: "pdf",
+    source_path: sourcePath,
+    target_type: "website",
+    target_ref: "",   // unused; URLs come from meta
+    mappings: mappings
+  });
+});
+</script>
+{% endblock %}
+```
+
+### Add `/api/pdf-info` to get page count
+
+In `app.py`:
+
+```python
+import pypdfium2 as pdfium
+# ...
+
+@app.route("/api/pdf-info", methods=["POST"])
+def pdf_info():
+  f = request.files.get("pdf")
+  if not f:
+    return jsonify({"error": "pdf file required"}), 400
+  os.makedirs(UPLOAD_DIR, exist_ok=True)
+  tmp_name = os.path.join(UPLOAD_DIR, f"tmp_{uuid.uuid4()}.pdf")
+  f.save(tmp_name)
+  doc = pdfium.PdfDocument(tmp_name)
+  pages = len(doc)
+  return jsonify({"pages": pages})
+```
+
+---
+
+## 6. Retest Endpoint: Run New Comparison and Classify Defects
+
+### `templates/retest.html` (revised)
+
+Allows:
+
+- Previous JSON file from first run
+- New source file + type (e.g., previous report PDF)
+- New target (file or URL) + type
+
+```html
+{% extends "base.html" %}
+{% block title %}Retest / Defect Validation{% endblock %}
+{% block content %}
+
+<h2>Retest / Defect Validation</h2>
+
+<form id="retest-form">
+  <fieldset>
+    <legend>Previous Result JSON</legend>
+    <p>Select the JSON file produced by the initial comparison.</p>
+    <input type="file" id="prev-json" accept=".json" required>
+  </fieldset>
+
+  <fieldset>
+    <legend>New Comparison Setup</legend>
+    <div>
+      <label>Source Type:
+        <select id="source-type">
+          <option value="pdf">PDF (e.g., previous report PDF or original spec PDF)</option>
+          <option value="image">Image</option>
+          <option value="msg_email">.msg Email</option>
+          <option value="html_file">HTML File</option>
+        </select>
+      </label>
+      <input type="file" id="source-file" required>
+    </div>
+
+    <div style="margin-top:8px;">
+      <label>Target Type:
+        <select id="target-type">
+          <option value="website">Website URL</option>
+          <option value="pdf">PDF</option>
+          <option value="msg_email">.msg Email</option>
+          <option value="image">Image</option>
+          <option value="html_file">HTML File</option>
+        </select>
+      </label>
+      <div id="target-file-wrapper">
+        <input type="file" id="target-file">
+      </div>
+      <div id="target-url-wrapper" style="display:none;">
+        <input type="url" id="target-url" placeholder="https://..." style="width:300px;">
+      </div>
+    </div>
+  </fieldset>
+
+  <button type="submit">Start Retest</button>
+</form>
+
+<hr>
+
+<p id="status">Idle</p>
+<pre id="result-text" style="border:1px solid #ccc; padding:8px; height:260px; overflow:auto;"></pre>
+
+<script>
+const targetTypeSelect = document.getElementById('target-type');
+const fileWrapper = document.getElementById('target-file-wrapper');
+const urlWrapper = document.getElementById('target-url-wrapper');
+
+targetTypeSelect.addEventListener('change', () => {
+  const val = targetTypeSelect.value;
+  if (val === 'website') {
+    fileWrapper.style.display = 'none';
+    urlWrapper.style.display = 'block';
+  } else {
+    fileWrapper.style.display = 'block';
+    urlWrapper.style.display = 'none';
+  }
+});
+
+document.getElementById('retest-form').addEventListener('submit', async function(e) {
+  e.preventDefault();
+
+  const prevJsonFile = document.getElementById('prev-json').files[0];
+  const sourceFile = document.getElementById('source-file').files[0];
+  const sourceType = document.getElementById('source-type').value;
+  const targetType = targetTypeSelect.value;
+
+  if (!prevJsonFile || !sourceFile) {
+    alert("Upload previous JSON and new source file.");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append('prev_json', prevJsonFile);
+  formData.append('source_file', sourceFile);
+  formData.append('source_type', sourceType);
+  formData.append('target_type', targetType);
+
+  if (targetType === 'website') {
+    const url = document.getElementById('target-url').value;
+    if (!url) { alert("Enter target URL"); return; }
+    formData.append('target_url', url);
+  } else {
+    const targetFile = document.getElementById('target-file').files[0];
+    if (!targetFile) { alert("Upload target file"); return; }
+    formData.append('target_file', targetFile);
+  }
+
+  document.getElementById('status').textContent = "Running retest...";
+  document.getElementById('result-text').textContent = "";
+
+  const resp = await fetch('/api/retest', { method: 'POST', body: formData });
+  const data = await resp.json();
+
+  if (data.error) {
+    document.getElementById('status').textContent = "Error: " + data.error;
+    return;
+  }
+
+  document.getElementById('status').textContent =
+    "Retest: " + data.overall_status +
+    " (Fixed: " + data.fixed_count +
+    ", Not fixed: " + data.not_fixed_count +
+    ", New: " + data.new_count + ")";
+
+  document.getElementById('result-text').textContent =
+    JSON.stringify(data.defects, null, 2);
+});
+</script>
+
+{% endblock %}
+```
+
+### `/api/retest` in `app.py`
+
+Add imports:
+
+```python
+from comparison.retest import compute_retest_result_from_dict
+from reports.json_store import load_result_json, save_result_json
+```
+
+Then add the route:
+
+```python
+@app.route("/api/retest", methods=["POST"])
+def api_retest():
+    """
+    Synchronous retest:
+    - prev_json: JSON from original run (contains original defects)
+    - source_file + source_type: new source (e.g. previous report PDF or original spec PDF)
+    - target_type + (target_file or target_url): updated target asset
+    Runs new comparison (page 1 ↔ page 1 by default), then classifies each original
+    defect as FIXED / NOT_FIXED and finds NEW issues.
+    """
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
+
+    prev_json_f = request.files.get("prev_json")
+    source_f = request.files.get("source_file")
+    target_f = request.files.get("target_file")
+    target_url = request.form.get("target_url")
+
+    source_type = request.form.get("source_type")
+    target_type = request.form.get("target_type")
+
+    if not prev_json_f or not source_f or not source_type or not target_type:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    # Save original JSON
+    prev_json_path = os.path.join(UPLOAD_DIR, f"prev_{uuid.uuid4()}.json")
+    prev_json_f.save(prev_json_path)
+    original_data = load_result_json(prev_json_path)
+
+    # Save new source
+    src_fname = f"src_{uuid.uuid4()}_{source_f.filename}"
+    src_path = os.path.join(UPLOAD_DIR, src_fname)
+    source_f.save(src_path)
+
+    # Determine target_ref
+    if target_type == "website":
+        target_ref = target_url
+        if not target_ref:
+            return jsonify({"error": "target_url required for website"}), 400
+    else:
+        if not target_f:
+            return jsonify({"error": "target_file required"}), 400
+        tgt_fname = f"tgt_{uuid.uuid4()}_{target_f.filename}"
+        tgt_path = os.path.join(UPLOAD_DIR, tgt_fname)
+        target_f.save(tgt_path)
+        target_ref = tgt_path
+
+    # Simple mapping: page 1 ↔ page 1 (extend as needed)
+    mappings = build_page_mappings([{
+        "source_page_idx": 0,
+        "target_page_idx": 0,
+        "meta": {}
+    }])
+
+    # Try to reuse validation_type from original JSON; default PDF_TO_PDF
+    vt_str = original_data.get("validation_type", "pdf_to_pdf")
+    try:
+        validation_type = ValidationType(vt_str)
+    except ValueError:
+        validation_type = ValidationType.PDF_TO_PDF
+
+    job_id = str(uuid.uuid4())
+
+    # No streaming for retest
+    def noop_stream(text_chunk: str, page_index: int, side: str):
+        pass
+
+    current_result = run_comparison_job(
+        job_id=job_id,
+        validation_type=validation_type,
+        source_type=source_type,
+        source_path=src_path,
+        target_type=target_type,
+        target_ref=target_ref,
+        mappings=mappings,
+        base_tmp_dir=TMP_DIR,
+        stream_callback=noop_stream
+    )
+
+    # Save current result JSON (optional)
+    out_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(out_dir, exist_ok=True)
+    json_path = os.path.join(out_dir, "result.json")
+    save_result_json(current_result, json_path)
+
+    # Compute retest statuses
+    retest_result = compute_retest_result_from_dict(original_data, current_result)
+
+    fixed_count = sum(1 for s in retest_result.statuses if s.status == "FIXED")
+    not_fixed_count = sum(1 for s in retest_result.statuses if s.status == "NOT_FIXED")
+    new_count = sum(1 for s in retest_result.statuses if s.status == "NEW")
+
+    defects_list = [
+        {
+            "defect_index": s.defect_id,
+            "issue": s.original_issue,
+            "status": s.status
+        }
+        for s in retest_result.statuses
+    ]
+
+    return jsonify({
+        "overall_status": retest_result.overall_status,
+        "fixed_count": fixed_count,
+        "not_fixed_count": not_fixed_count,
+        "new_count": new_count,
+        "defects": defects_list
+    })
+```
+
+---
+
+At this point you have:
+
+- Multi‑mapping card marketplace UI and pipeline that handles pages and offer‑details modals per mapping.
+- Full OCR + diff pipeline, with live character‑streaming over Socket.IO.
+- Image highlighting for differences on both source/target images in reports.
+- JSON report storage and a retest endpoint that runs a new comparison and clearly reports FIXED / NOT_FIXED / NEW defects.
+
+You can now harden and style the UI, plug in the real LightOnOCR call into `run_lighton_ocr`, and then package with PyInstaller as a standalone `.exe` with bundled Chrome/ChromeDriver.
